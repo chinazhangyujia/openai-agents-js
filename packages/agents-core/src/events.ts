@@ -42,7 +42,8 @@ export type RunItemStreamEventName =
   | 'tool_called'
   | 'tool_output'
   | 'reasoning_item_created'
-  | 'tool_approval_requested';
+  | 'tool_approval_requested'
+  | 'user_input_received';
 
 /**
  * Streaming events that wrap a `RunItem`. As the agent processes the LLM response, it will generate

@@ -9,6 +9,7 @@ import helloWorldExample from '../../../../../examples/docs/hello-world.ts?raw';
 import runningAgentsExceptionExample from '../../../../../examples/docs/running-agents/exceptions1.ts?raw';
 import chatLoopExample from '../../../../../examples/docs/running-agents/chatLoop.ts?raw';
 import conversationIdExample from '../../../../../examples/docs/running-agents/conversationId.ts?raw';
+import inboxExample from '../../../../../examples/docs/running-agents/inbox.ts?raw';
 import previousResponseIdExample from '../../../../../examples/docs/running-agents/previousResponseId.ts?raw';
 
 Agents do nothing by themselves – you **run** them with the `Runner` class or the `run()` utility.
@@ -63,6 +64,7 @@ The additional options are:
 | `context` | – | Context object forwarded to every tool / guardrail / handoff. Learn more in the [context guide](/openai-agents-js/guides/context). |
 | `maxTurns` | `10` | Safety limit – throws [`MaxTurnsExceededError`](/openai-agents-js/openai/agents-core/classes/maxturnsexceedederror) when reached. |
 | `signal` | – | `AbortSignal` for cancellation. |
+| `inbox` | – | [`RunInbox`](/openai-agents-js/openai/agents-core/classes/runinbox) for delivering user messages mid-run without aborting. See [Mid-run user input](#mid-run-user-input). |
 | `session` | – | Session persistence implementation. See the [sessions guide](/openai-agents-js/guides/sessions). |
 | `sessionInputCallback` | – | Custom merge logic for session history and new input; runs before the model call. See [sessions](/openai-agents-js/guides/sessions). |
 | `callModelInputFilter` | – | Hook to edit the model input (items + optional instructions) just before calling the model. See [Call model input filter](#call-model-input-filter). |
@@ -76,6 +78,18 @@ The additional options are:
 ### Streaming
 
 Streaming allows you to additionally receive streaming events as the LLM runs. Once the stream is started, the `StreamedRunResult` will contain the complete information about the run, including all the new outputs produces. You can iterate over the streaming events using a `for await` loop. Read more in the [streaming guide](/openai-agents-js/guides/streaming).
+
+### Mid-run user input
+
+`RunInbox` is a queue-shaped analog to `AbortSignal` – the caller holds the inbox, the runner observes it. Pass one as `inbox` in `RunOptions` and call `inbox.send(...)` from any external context (a websocket handler, an HTTP endpoint, another async task) while the run is in progress. Messages drained from the inbox are appended to the conversation history at the next turn boundary, so the next model call sees them.
+
+<Code
+  lang="typescript"
+  code={inboxExample}
+  title="Delivering a message mid-run"
+/>
+
+Messages are delivered between turns, never mid-model-call. If a message arrives while the model is producing the final output (or during output-guardrail work), the runner extends the loop by one turn so the message is incorporated rather than dropped. When streaming, each delivery emits a `user_input_received` event so consumers can react in real time. Input guardrails configured on the runner or active agent run against the drained batch before it reaches state, so inbox content cannot bypass screening.
 
 ### Run config
 

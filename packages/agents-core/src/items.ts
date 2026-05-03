@@ -46,6 +46,46 @@ export class RunMessageOutputItem extends RunItemBase {
   }
 }
 
+/**
+ * A user message that was injected into a running loop via {@link RunInbox}. The runner appends
+ * one of these to `state._generatedItems` at the start of each turn for every message drained
+ * from the inbox. Treating these as run items (rather than mutating `_originalInput`) preserves
+ * chronological order in `result.history` and ensures they survive `RunState` serialization.
+ *
+ * The `agent` field records which agent was active at drain time, mirroring the pattern used by
+ * other run items.
+ */
+export class RunUserInputItem extends RunItemBase {
+  public readonly type = 'user_input_item' as const;
+
+  constructor(
+    public rawItem: protocol.UserMessageItem,
+    public agent: Agent,
+  ) {
+    super();
+  }
+
+  toJSON() {
+    return {
+      ...super.toJSON(),
+      agent: this.agent.toJSON(),
+    };
+  }
+
+  get content(): string {
+    if (typeof this.rawItem.content === 'string') {
+      return this.rawItem.content;
+    }
+    let content = '';
+    for (const part of this.rawItem.content) {
+      if (part.type === 'input_text') {
+        content += part.text;
+      }
+    }
+    return content;
+  }
+}
+
 export class RunToolCallItem extends RunItemBase {
   public readonly type = 'tool_call_item' as const;
 
@@ -283,6 +323,7 @@ function getStringProperty(item: object, key: string): string | undefined {
 
 export type RunItem =
   | RunMessageOutputItem
+  | RunUserInputItem
   | RunToolCallItem
   | RunToolSearchCallItem
   | RunToolSearchOutputItem

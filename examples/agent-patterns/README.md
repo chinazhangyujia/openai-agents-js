@@ -1,7 +1,6 @@
 # Agent Pattern Examples
 
-This directory contains small scripts that demonstrate different agent patterns.
-Run them with `pnpm` using the commands shown below.
+This directory contains small scripts that demonstrate different agent patterns. Run them with `pnpm` using the commands shown below.
 
 - `agents-as-tools.ts` – Orchestrate translator agents using them as tools.
   ```bash
@@ -30,6 +29,10 @@ Run them with `pnpm` using the commands shown below.
 - `human-in-the-loop-stream.ts` – Streaming version of human approval.
   ```bash
   pnpm examples:streamed:human-in-the-loop
+  ```
+- `inbox.ts` – Deliver mid-run user messages via `RunInbox` without aborting the run.
+  ```bash
+  pnpm -F agent-patterns start:inbox
   ```
 - `input-guardrails.ts` – Reject unwanted requests with guardrails.
   ```bash

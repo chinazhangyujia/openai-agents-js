@@ -12,6 +12,7 @@ import {
   RunReasoningItem,
   RunHandoffCallItem,
   RunHandoffOutputItem,
+  RunUserInputItem,
 } from './items';
 import type { ModelResponse, ModelSettings } from './model';
 import { RunContext } from './runContext';
@@ -77,8 +78,9 @@ import {
  * - 1.7: Adds optional approval rejection messages.
  * - 1.8: Adds tool search item variants, batched computer actions, and GA computer tool
  *   aliasing to serialized run state payloads.
+ * - 1.9: Adds user_input_item variant to support {@link RunInbox} message injection.
  */
-export const CURRENT_SCHEMA_VERSION = '1.8' as const;
+export const CURRENT_SCHEMA_VERSION = '1.9' as const;
 const SUPPORTED_SCHEMA_VERSIONS = [
   '1.0',
   '1.1',
@@ -88,6 +90,7 @@ const SUPPORTED_SCHEMA_VERSIONS = [
   '1.5',
   '1.6',
   '1.7',
+  '1.8',
   CURRENT_SCHEMA_VERSION,
 ] as const;
 type SupportedSchemaVersion = (typeof SUPPORTED_SCHEMA_VERSIONS)[number];
@@ -161,6 +164,11 @@ const itemSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('message_output_item'),
     rawItem: protocol.AssistantMessageItem,
+    agent: serializedAgentSchema,
+  }),
+  z.object({
+    type: z.literal('user_input_item'),
+    rawItem: protocol.UserMessageItem,
     agent: serializedAgentSchema,
   }),
   z.object({
@@ -974,6 +982,10 @@ async function buildRunStateFromString<
     currentSchemaVersion as SupportedSchemaVersion,
     stateJson,
   );
+  assertSchemaVersionSupportsUserInputItems(
+    currentSchemaVersion as SupportedSchemaVersion,
+    stateJson,
+  );
   return buildRunStateFromJson(initialAgent, stateJson, options);
 }
 
@@ -981,7 +993,7 @@ function assertSchemaVersionSupportsToolSearch(
   schemaVersion: SupportedSchemaVersion,
   stateJson: z.infer<typeof SerializedRunState>,
 ): void {
-  if (schemaVersion === '1.8') {
+  if (schemaVersion === '1.8' || schemaVersion === '1.9') {
     return;
   }
 
@@ -992,6 +1004,29 @@ function assertSchemaVersionSupportsToolSearch(
   throw new UserError(
     `Run state schema version ${schemaVersion} does not support tool_search items. Please reserialize the run state with schema ${CURRENT_SCHEMA_VERSION}.`,
   );
+}
+
+function assertSchemaVersionSupportsUserInputItems(
+  schemaVersion: SupportedSchemaVersion,
+  stateJson: z.infer<typeof SerializedRunState>,
+): void {
+  if (schemaVersion === '1.9') {
+    return;
+  }
+
+  if (!containsUserInputRunItems(stateJson.generatedItems)) {
+    return;
+  }
+
+  throw new UserError(
+    `Run state schema version ${schemaVersion} does not support user_input_item entries. Please reserialize the run state with schema ${CURRENT_SCHEMA_VERSION}.`,
+  );
+}
+
+function containsUserInputRunItems(
+  items: z.infer<typeof itemSchema>[] | undefined,
+): boolean {
+  return Boolean(items?.some((item) => item.type === 'user_input_item'));
 }
 
 function containsSerializedToolSearchState(
@@ -1565,6 +1600,11 @@ export function deserializeItem(
   switch (serializedItem.type) {
     case 'message_output_item':
       return new RunMessageOutputItem(
+        serializedItem.rawItem,
+        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+      );
+    case 'user_input_item':
+      return new RunUserInputItem(
         serializedItem.rawItem,
         agentMap.get(serializedItem.agent.name) as Agent<any, any>,
       );
