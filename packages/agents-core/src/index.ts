@@ -97,7 +97,9 @@ export {
   RunToolCallOutputItem,
   RunToolSearchCallItem,
   RunToolSearchOutputItem,
+  RunUserInputItem,
 } from './items';
+export { RunInbox } from './inbox';
 export { AgentHooks } from './lifecycle';
 export { getLogger } from './logger';
 export { applyDiff } from './utils/applyDiff';

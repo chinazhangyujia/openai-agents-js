@@ -156,10 +156,21 @@ class RunResultBase<
    *
    * It does not include information about the agents and instead represents the model data.
    *
+   * Items injected via {@link RunInbox} are user-originated input rather than model output, so
+   * they are excluded here. They remain in `newItems` and `history` for callers that need the
+   * full chronological record.
+   *
    * For the output including the agents, use the `newItems` property.
    */
   get output(): AgentOutputItem[] {
-    return getTurnInput([], this.newItems, this.state._reasoningItemIdPolicy);
+    const modelProducedItems = this.newItems.filter(
+      (item) => item.type !== 'user_input_item',
+    );
+    return getTurnInput(
+      [],
+      modelProducedItems,
+      this.state._reasoningItemIdPolicy,
+    );
   }
 
   /**

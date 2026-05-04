@@ -194,13 +194,29 @@ export async function runInputGuardrails<
 >(
   state: RunState<TContext, TAgent>,
   guardrails: InputGuardrailDefinition[],
+  options: {
+    /**
+     * Override the input items the guardrails screen. Defaults to `state._originalInput`.
+     * Used by the inbox path so guardrails see the newly arrived messages, not the initial
+     * input.
+     */
+    input?: Parameters<InputGuardrailDefinition['run']>[0]['input'];
+    /**
+     * If `true` (default), decrement `state._currentTurn` before throwing
+     * `GuardrailExecutionError` so callers can retry from a clean state. Set to `false` for
+     * mid-run guardrail invocations (such as inbox drains) where rolling back the turn would
+     * leave the run in an inconsistent state.
+     */
+    rollbackTurnOnError?: boolean;
+  } = {},
 ): Promise<InputGuardrailResult[]> {
   if (guardrails.length === 0) {
     return [];
   }
+  const rollbackTurnOnError = options.rollbackTurnOnError ?? true;
   const guardrailArgs = {
     agent: state._currentAgent,
-    input: state._originalInput,
+    input: options.input ?? state._originalInput,
     context: state._context,
   };
   return await runGuardrailsWithTripwire({
@@ -218,8 +234,10 @@ export async function runInputGuardrails<
     isTripwireError: (error) =>
       error instanceof InputGuardrailTripwireTriggered,
     onError: (error) => {
-      // roll back the current turn to enable reruns
-      state._currentTurn--;
+      if (rollbackTurnOnError) {
+        // roll back the current turn to enable reruns
+        state._currentTurn--;
+      }
       throw new GuardrailExecutionError(
         `Input guardrail failed to complete: ${error}`,
         error as Error,

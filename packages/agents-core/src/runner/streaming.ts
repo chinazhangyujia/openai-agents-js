@@ -11,6 +11,7 @@ import {
   RunToolCallOutputItem,
   RunToolSearchCallItem,
   RunToolSearchOutputItem,
+  RunUserInputItem,
 } from '../items';
 import { StreamedRunResult } from '../result';
 
@@ -38,6 +39,9 @@ function getRunItemStreamEventName(
 ): RunItemStreamEventName | undefined {
   if (item instanceof RunMessageOutputItem) {
     return 'message_output_created';
+  }
+  if (item instanceof RunUserInputItem) {
+    return 'user_input_received';
   }
   if (item instanceof RunHandoffCallItem) {
     return 'handoff_requested';

@@ -37,6 +37,8 @@ import { DEFAULT_MAX_TURNS } from './runner/constants';
 import { StreamEventResponseCompleted } from './types/protocol';
 import type { Session, SessionInputCallback } from './memory/session';
 import type { AgentInputItem } from './types';
+import { RunInbox } from './inbox';
+import { drainInboxIntoState } from './runner/inbox';
 import {
   ServerConversationTracker,
   applyCallModelInputFilter,
@@ -262,6 +264,18 @@ type SharedRunOptions<
   toolErrorFormatter?: ToolErrorFormatter;
   reasoningItemIdPolicy?: ReasoningItemIdPolicy;
   tracing?: TracingConfig;
+  /**
+   * Optional message inbox for delivering user input into a running agent loop without
+   * aborting. Callers hold the {@link RunInbox} reference and call `inbox.send(...)` from
+   * outside the run; the runner drains pending messages at each turn boundary and inserts
+   * them into the conversation history so the next model call sees them.
+   *
+   * Conceptually a queue-shaped analog to {@link AbortSignal} — `signal` lets the caller stop
+   * a run, `inbox` lets the caller append to one. Messages are delivered between turns, never
+   * mid-model-call. If the model produces a final output while the inbox holds queued messages,
+   * the runner extends the loop by one extra turn so those messages are not dropped.
+   */
+  inbox?: RunInbox;
   /**
    * Error handlers keyed by error kind.
    */
@@ -741,6 +755,14 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
           if (state._currentStep.type === 'next_step_run_again') {
             const wasContinuingInterruptedTurn = continuingInterruptedTurn;
             continuingInterruptedTurn = false;
+            // Drain any messages queued via the inbox into _generatedItems so prepareTurn picks
+            // them up as part of the model input for this turn. Input guardrails run inside the
+            // drain so inbox content cannot bypass screening; tripwires throw out of the loop.
+            await drainInboxIntoState(
+              state,
+              options.inbox,
+              this.inputGuardrailDefs,
+            );
             const guardrailTracker = createGuardrailTracker();
             const previousTurn = state._currentTurn;
             const previousPersistedCount = state._currentTurnPersistedItemCount;
@@ -877,11 +899,28 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
 
           switch (currentStep.type) {
             case 'next_step_final_output':
+              if (options.inbox && options.inbox.size > 0) {
+                // A message arrived while the model was producing the final output. Run one more
+                // turn so it is incorporated rather than dropped. Output guardrails for this step
+                // are skipped intentionally — they will run on the eventual final output.
+                state._currentStep = { type: 'next_step_run_again' };
+                state._currentTurnInProgress = false;
+                break;
+              }
               await runOutputGuardrails(
                 state,
                 this.outputGuardrailDefs,
                 currentStep.output,
               );
+              if (options.inbox && options.inbox.size > 0) {
+                // A message arrived during output-guardrail / persistence work. Roll back the
+                // final-output decision and run another turn so the message is delivered.
+                // Discarding the just-computed guardrail result is fine: the next final output
+                // will get its own pass.
+                state._currentStep = { type: 'next_step_run_again' };
+                state._currentTurnInProgress = false;
+                break;
+              }
               state._currentTurnInProgress = false;
               this.emit(
                 'agent_end',
@@ -1098,6 +1137,19 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
           guardrailTracker = createGuardrailTracker();
           const wasContinuingInterruptedTurn = continuingInterruptedTurn;
           continuingInterruptedTurn = false;
+          // Drain any messages queued via the inbox into _generatedItems so prepareTurn picks
+          // them up as part of the model input for this turn. Input guardrails run inside the
+          // drain so inbox content cannot bypass screening; tripwires throw out of the loop.
+          // Stream a `user_input_received` event for each drained message so consumers can
+          // react in real time.
+          const drainedInboxItems = await drainInboxIntoState(
+            result.state,
+            options.inbox,
+            this.inputGuardrailDefs,
+          );
+          if (drainedInboxItems.length > 0) {
+            streamStepItemsToRunResult(result, drainedInboxItems);
+          }
           const previousTurn = result.state._currentTurn;
           const previousPersistedCount =
             result.state._currentTurnPersistedItemCount;
@@ -1307,6 +1359,14 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
         const currentStep = result.state._currentStep;
         switch (currentStep.type) {
           case 'next_step_final_output':
+            if (options.inbox && options.inbox.size > 0) {
+              // A message arrived while the model was producing the final output. Run one more
+              // turn so it is incorporated rather than dropped. Output guardrails for this step
+              // are skipped intentionally — they will run on the eventual final output.
+              result.state._currentStep = { type: 'next_step_run_again' };
+              result.state._currentTurnInProgress = false;
+              break;
+            }
             try {
               await runOutputGuardrails(
                 result.state,
@@ -1318,6 +1378,15 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
               result.state._currentStep = undefined;
               result.state._finalOutputSource = undefined;
               throw error;
+            }
+            if (options.inbox && options.inbox.size > 0) {
+              // A message arrived during output-guardrail work. Roll back the final-output
+              // decision and run another turn so the message is delivered. Discarding the
+              // just-computed guardrail result is fine: the next final output will get its
+              // own pass.
+              result.state._currentStep = { type: 'next_step_run_again' };
+              result.state._currentTurnInProgress = false;
+              break;
             }
             result.state._currentTurnInProgress = false;
             await persistStreamInputIfNeeded();
