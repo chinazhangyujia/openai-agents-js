@@ -3,6 +3,7 @@ import {
   Agent,
   AgentInputItem,
   InputGuardrailTripwireTriggered,
+  MaxTurnsExceededError,
   MemorySession,
   RunInbox,
   RunUserInputItem,
@@ -278,6 +279,65 @@ describe('Runner.run with inbox (non-streaming)', () => {
     expect(inboxIdx).toBeGreaterThan(callIdx);
 
     // Inbox is drained after delivery.
+    expect(inbox.size).toBe(0);
+  });
+
+  it('preserves drained inbox messages on `state` when the next turn exceeds maxTurns', async () => {
+    // Regression guard: drainInboxIntoState pushes RunUserInputItems onto state._generatedItems
+    // BEFORE prepareTurn enforces maxTurns, and MaxTurnsExceededError carries `state`. So even
+    // when the very next turn would max out, the drained content is reachable via `error.state`
+    // and the caller can resume.
+    const responses: ModelResponse[] = [
+      {
+        output: [functionCall('call_1', 'noop')],
+        usage: new Usage(),
+      },
+    ];
+
+    const inbox = new RunInbox();
+    const model = new RecordingModel(responses, {
+      onCall: (callIndex) => {
+        if (callIndex === 0) {
+          inbox.send('queued mid-run before maxTurns trips');
+        }
+      },
+    });
+
+    const agent = new Agent({
+      name: 'InboxAgent',
+      model,
+      tools: [
+        {
+          type: 'function',
+          name: 'noop',
+          description: 'no op',
+          strict: true,
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false,
+          },
+          needsApproval: async () => false,
+          invoke: async () => 'ok',
+        } as any,
+      ],
+    });
+
+    let caught: unknown;
+    try {
+      await new Runner().run(agent, 'kick off', { inbox, maxTurns: 1 });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(MaxTurnsExceededError);
+    const error = caught as MaxTurnsExceededError;
+    expect(error.state).toBeDefined();
+    const inboxItems = error.state!._generatedItems.filter(
+      (item) => item instanceof RunUserInputItem,
+    ) as RunUserInputItem[];
+    expect(inboxItems).toHaveLength(1);
+    expect(inboxItems[0].content).toBe('queued mid-run before maxTurns trips');
     expect(inbox.size).toBe(0);
   });
 
