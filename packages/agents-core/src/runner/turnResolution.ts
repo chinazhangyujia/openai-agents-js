@@ -3,7 +3,7 @@ import { Agent } from '../agent';
 import { ModelBehaviorError, ModelRefusalError } from '../errors';
 import { RunItem, RunMessageOutputItem, RunToolApprovalItem } from '../items';
 import { ModelResponse } from '../model';
-import type { Runner, ToolErrorFormatter } from '../run';
+import type { RunConfig, Runner, ToolErrorFormatter } from '../run';
 import { RunState } from '../runState';
 import {
   getRefusalFromOutputMessage,
@@ -13,7 +13,12 @@ import { getSchemaAndParserFromInputType } from '../utils/tools';
 import { safeExecute } from '../utils/safeExecute';
 import { addErrorToCurrentSpan } from '../tracing/context';
 import { NextStep, SingleStepResult, nextStepSchema } from './steps';
-import type { ProcessedResponse, ToolRunHandoff } from './types';
+import type {
+  ProcessedResponse,
+  ToolRunApplyPatch,
+  ToolRunHandoff,
+  ToolRunShell,
+} from './types';
 import {
   checkForFinalOutputFromTools,
   executeApplyPatchOperations,
@@ -206,10 +211,9 @@ function buildApprovedCallIdSet(
     if (!rawItem || rawItem.type !== type) {
       continue;
     }
-    if ('callId' in rawItem && rawItem.callId) {
-      callIds.add(rawItem.callId);
-    } else if ('id' in rawItem && rawItem.id) {
-      callIds.add(rawItem.id);
+    const callKey = getToolActionKey(rawItem);
+    if (callKey) {
+      callIds.add(callKey);
     }
   }
   return callIds;
@@ -242,14 +246,24 @@ function filterActionsByApproval<T extends { toolCall: { callId?: string } }>(
   if (allowedCallIds.size === 0) {
     return [];
   }
-  return actions.filter(
-    (action) =>
-      typeof action.toolCall.callId === 'string' &&
-      allowedCallIds.has(action.toolCall.callId),
-  );
+  return actions.filter((action) => {
+    const callKey = getToolActionKey(action.toolCall);
+    return typeof callKey === 'string' && allowedCallIds.has(callKey);
+  });
 }
 
-type ToolActionWithCallId = { toolCall: { callId?: string } };
+type ToolActionWithCallId = {
+  toolCall: { callId?: string; id?: string };
+};
+
+type OrderedShellOrApplyPatchAction =
+  | { type: 'shell'; action: ToolRunShell }
+  | { type: 'apply_patch'; action: ToolRunApplyPatch };
+
+type QueuedActionsByCallId<T> = {
+  byCallId: Map<string, T[]>;
+  withoutCallId: T[];
+};
 
 function filterPendingActions<T extends ToolActionWithCallId>(
   actions: T[],
@@ -273,6 +287,155 @@ function filterPendingActions<T extends ToolActionWithCallId>(
 
     return true;
   });
+}
+
+function queueActionsByCallId<T extends ToolActionWithCallId>(
+  actions: T[],
+): QueuedActionsByCallId<T> {
+  const queued: QueuedActionsByCallId<T> = {
+    byCallId: new Map<string, T[]>(),
+    withoutCallId: [],
+  };
+  for (const action of actions) {
+    const callKey = getToolActionKey(action.toolCall);
+    if (!callKey) {
+      queued.withoutCallId.push(action);
+      continue;
+    }
+    const actionsForCallId = queued.byCallId.get(callKey) ?? [];
+    actionsForCallId.push(action);
+    queued.byCallId.set(callKey, actionsForCallId);
+  }
+  return queued;
+}
+
+function takeQueuedAction<T>(
+  actionsByCallId: Map<string, T[]>,
+  callId: string,
+): T | undefined {
+  const queued = actionsByCallId.get(callId);
+  const action = queued?.shift();
+  if (!queued || queued.length === 0) {
+    actionsByCallId.delete(callId);
+  }
+  return action;
+}
+
+function appendRemainingQueuedActions<T>(
+  target: T[],
+  actionsByCallId: Map<string, T[]>,
+): void {
+  for (const queued of actionsByCallId.values()) {
+    target.push(...queued);
+  }
+}
+
+function orderShellAndApplyPatchActions(
+  sourceItems: RunItem[],
+  shellActions: ToolRunShell[],
+  applyPatchActions: ToolRunApplyPatch[],
+): OrderedShellOrApplyPatchAction[] {
+  const shellActionsByCallId = queueActionsByCallId(shellActions);
+  const applyPatchActionsByCallId = queueActionsByCallId(applyPatchActions);
+  const orderedActions: OrderedShellOrApplyPatchAction[] = [];
+
+  for (const item of sourceItems) {
+    const rawItem = item.rawItem;
+    if (rawItem?.type === 'shell_call') {
+      const callKey = getToolActionKey(rawItem);
+      const action = takeQueuedAction(
+        shellActionsByCallId.byCallId,
+        callKey ?? '',
+      );
+      if (action) {
+        orderedActions.push({ type: 'shell', action });
+      }
+      continue;
+    }
+    if (rawItem?.type === 'apply_patch_call') {
+      const callKey = getToolActionKey(rawItem);
+      const action = takeQueuedAction(
+        applyPatchActionsByCallId.byCallId,
+        callKey ?? '',
+      );
+      if (action) {
+        orderedActions.push({ type: 'apply_patch', action });
+      }
+    }
+  }
+
+  const remainingShellActions: ToolRunShell[] = [];
+  appendRemainingQueuedActions(
+    remainingShellActions,
+    shellActionsByCallId.byCallId,
+  );
+  remainingShellActions.push(...shellActionsByCallId.withoutCallId);
+  for (const action of remainingShellActions) {
+    orderedActions.push({ type: 'shell', action });
+  }
+
+  const remainingApplyPatchActions: ToolRunApplyPatch[] = [];
+  appendRemainingQueuedActions(
+    remainingApplyPatchActions,
+    applyPatchActionsByCallId.byCallId,
+  );
+  remainingApplyPatchActions.push(...applyPatchActionsByCallId.withoutCallId);
+  for (const action of remainingApplyPatchActions) {
+    orderedActions.push({ type: 'apply_patch', action });
+  }
+
+  return orderedActions;
+}
+
+function getToolActionKey(value: {
+  callId?: unknown;
+  id?: unknown;
+}): string | undefined {
+  if (typeof value.callId === 'string' && value.callId.length > 0) {
+    return value.callId;
+  }
+  if (typeof value.id === 'string' && value.id.length > 0) {
+    return value.id;
+  }
+  return undefined;
+}
+
+async function executeShellAndApplyPatchActionsInOrder<TContext>(args: {
+  agent: Agent<TContext, any>;
+  sourceItems: RunItem[];
+  shellActions: ToolRunShell[];
+  applyPatchActions: ToolRunApplyPatch[];
+  runner: Runner;
+  state: RunState<TContext, Agent<TContext, any>>;
+  toolErrorFormatter?: ToolErrorFormatter;
+}): Promise<RunItem[]> {
+  const results: RunItem[] = [];
+  for (const action of orderShellAndApplyPatchActions(
+    args.sourceItems,
+    args.shellActions,
+    args.applyPatchActions,
+  )) {
+    const items =
+      action.type === 'shell'
+        ? await executeShellActions(
+            args.agent,
+            [action.action],
+            args.runner,
+            args.state._context,
+            undefined,
+            args.toolErrorFormatter,
+          )
+        : await executeApplyPatchOperations(
+            args.agent,
+            [action.action],
+            args.runner,
+            args.state._context,
+            undefined,
+            args.toolErrorFormatter,
+          );
+    results.push(...items);
+  }
+  return results;
 }
 
 function truncateForDeveloper(message: string, maxLength = 160): string {
@@ -327,6 +490,7 @@ export async function resolveInterruptedTurn<TContext>(
   runner: Runner,
   state: RunState<TContext, Agent<TContext, any>>,
   toolErrorFormatter?: ToolErrorFormatter,
+  agentToolParentRunConfig?: Partial<RunConfig>,
 ): Promise<SingleStepResult> {
   // call_ids for function tools
   const functionCallIds = originalPreStepItems
@@ -462,6 +626,7 @@ export async function resolveInterruptedTurn<TContext>(
     runner,
     state,
     toolErrorFormatter,
+    agentToolParentRunConfig,
   );
 
   // Computer actions may require approval; only pending approved actions are executed on resume.
@@ -477,28 +642,17 @@ export async function resolveInterruptedTurn<TContext>(
         )
       : [];
 
-  const shellResults =
-    shellRuns.length > 0
-      ? await executeShellActions(
+  const shellAndApplyPatchResults =
+    shellRuns.length > 0 || applyPatchRuns.length > 0
+      ? await executeShellAndApplyPatchActionsInOrder({
           agent,
-          shellRuns,
+          sourceItems: originalPreStepItems,
+          shellActions: shellRuns,
+          applyPatchActions: applyPatchRuns,
           runner,
-          state._context,
-          undefined,
+          state,
           toolErrorFormatter,
-        )
-      : [];
-
-  const applyPatchResults =
-    applyPatchRuns.length > 0
-      ? await executeApplyPatchOperations(
-          agent,
-          applyPatchRuns,
-          runner,
-          state._context,
-          undefined,
-          toolErrorFormatter,
-        )
+        })
       : [];
 
   const newItems: RunItem[] = [];
@@ -521,17 +675,13 @@ export async function resolveInterruptedTurn<TContext>(
     appendIfNew(result);
   }
 
-  for (const result of shellResults) {
-    appendIfNew(result);
-  }
-
-  for (const result of applyPatchResults) {
+  for (const result of shellAndApplyPatchResults) {
     appendIfNew(result);
   }
 
   const additionalInterruptions = collectInterruptions(
     [],
-    [...computerResults, ...shellResults, ...applyPatchResults],
+    [...computerResults, ...shellAndApplyPatchResults],
   );
 
   const hostedMcpApprovals = await handleHostedMcpApprovals({
@@ -650,6 +800,7 @@ export async function resolveTurnAfterModelResponse<
   runner: Runner,
   state: RunState<TContext, TAgent>,
   toolErrorFormatter?: ToolErrorFormatter,
+  agentToolParentRunConfig?: Partial<RunConfig>,
   errorHandlers?: RunErrorHandlers<TContext, TAgent>,
 ): Promise<SingleStepResult> {
   // Reuse the same array reference so we can compare object identity when deciding whether to
@@ -665,40 +816,38 @@ export async function resolveTurnAfterModelResponse<
   }
 
   // Run function tools and computer actions in parallel; neither depends on the other's side effects.
-  const [functionResults, computerResults, shellResults, applyPatchResults] =
-    await Promise.all([
-      executeFunctionToolCalls(
-        agent,
-        processedResponse.functions,
-        runner,
-        state,
-        toolErrorFormatter,
-      ),
-      executeComputerActions(
-        agent,
-        processedResponse.computerActions,
-        runner,
-        state._context,
-        undefined,
-        toolErrorFormatter,
-      ),
-      executeShellActions(
-        agent,
-        processedResponse.shellActions,
-        runner,
-        state._context,
-        undefined,
-        toolErrorFormatter,
-      ),
-      executeApplyPatchOperations(
-        agent,
-        processedResponse.applyPatchActions,
-        runner,
-        state._context,
-        undefined,
-        toolErrorFormatter,
-      ),
-    ]);
+  // Shell and apply_patch actions both mutate the sandbox filesystem, so preserve model order.
+  const [functionResults, computerResults] = await Promise.all([
+    executeFunctionToolCalls(
+      agent,
+      processedResponse.functions,
+      runner,
+      state,
+      toolErrorFormatter,
+      agentToolParentRunConfig,
+    ),
+    executeComputerActions(
+      agent,
+      processedResponse.computerActions,
+      runner,
+      state._context,
+      undefined,
+      toolErrorFormatter,
+    ),
+  ]);
+  const shellAndApplyPatchResults =
+    processedResponse.shellActions.length > 0 ||
+    processedResponse.applyPatchActions.length > 0
+      ? await executeShellAndApplyPatchActionsInOrder({
+          agent,
+          sourceItems: processedResponse.newItems,
+          shellActions: processedResponse.shellActions,
+          applyPatchActions: processedResponse.applyPatchActions,
+          runner,
+          state,
+          toolErrorFormatter,
+        })
+      : [];
 
   for (const result of functionResults) {
     if (
@@ -713,16 +862,13 @@ export async function resolveTurnAfterModelResponse<
   for (const item of computerResults) {
     appendIfNew(item);
   }
-  for (const item of shellResults) {
-    appendIfNew(item);
-  }
-  for (const item of applyPatchResults) {
+  for (const item of shellAndApplyPatchResults) {
     appendIfNew(item);
   }
 
   const additionalInterruptions = collectInterruptions(
     [],
-    [...computerResults, ...shellResults, ...applyPatchResults],
+    [...computerResults, ...shellAndApplyPatchResults],
   );
 
   if (processedResponse.mcpApprovalRequests.length > 0) {
