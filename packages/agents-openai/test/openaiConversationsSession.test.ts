@@ -396,6 +396,60 @@ describe('OpenAIConversationsSession', () => {
     ]);
   });
 
+  it('strips assistant conversation replay metadata only for model input', async () => {
+    const session = createSession({
+      client: {
+        conversations: {
+          items: {
+            list: vi.fn(),
+            create: vi.fn(),
+            delete: vi.fn(),
+          },
+          create: vi.fn(),
+          delete: vi.fn(),
+        },
+      } as any,
+      conversationId: 'conv-123',
+    });
+
+    const userItem = {
+      id: 'conv-user',
+      type: 'message',
+      role: 'user',
+      content: 'user history',
+      providerData: { server: 'metadata' },
+    };
+    const assistantItem = {
+      id: 'conv-assistant',
+      type: 'message',
+      role: 'assistant',
+      content: [],
+      providerData: { server: 'metadata' },
+      provider_data: { server: 'snake' },
+    };
+    const functionCallItem = {
+      id: 'conv-call',
+      type: 'function_call',
+      name: 'lookup',
+      callId: 'call-history',
+      arguments: '{}',
+    };
+
+    expect(session.prepareHistoryItemForModelInput(userItem as any)).toEqual(
+      userItem,
+    );
+    expect(
+      session.prepareHistoryItemForModelInput(functionCallItem as any),
+    ).toEqual(functionCallItem);
+    expect(
+      session.prepareHistoryItemForModelInput(assistantItem as any),
+    ).toEqual({
+      type: 'message',
+      role: 'assistant',
+      content: [],
+    });
+  });
+
   it('adds items without requesting additional response includes', async () => {
     const createMock = vi.fn();
     const inputItems = [
@@ -413,7 +467,6 @@ describe('OpenAIConversationsSession', () => {
         type: 'message',
         role: 'user',
         content: [],
-        // model should be stripped, but other providerData should stay if present
         providerData: { extra: 'keep-me' },
       },
     ];
@@ -451,11 +504,17 @@ describe('OpenAIConversationsSession', () => {
       }),
     );
     expect(createMock).toHaveBeenCalledWith('conv-123', {
-      items: converted,
+      items: [
+        {
+          type: 'message',
+          role: 'user',
+          content: [],
+        },
+      ],
     });
   });
 
-  it('keeps providerData for hosted tool calls', async () => {
+  it('strips persistence metadata after converting hosted tool calls', async () => {
     const createMock = vi.fn();
     const inputItems = [
       {
@@ -509,7 +568,14 @@ describe('OpenAIConversationsSession', () => {
       }),
     );
     expect(createMock).toHaveBeenCalledWith('conv-123', {
-      items: converted,
+      items: [
+        {
+          type: 'function_call',
+          name: 'search',
+          call_id: 'call-1',
+          arguments: '{}',
+        },
+      ],
     });
   });
 
