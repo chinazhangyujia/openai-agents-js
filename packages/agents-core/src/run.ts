@@ -288,7 +288,7 @@ type SharedRunOptions<
   TAgent extends Agent<any, any> = Agent<any, any>,
 > = {
   context?: TContext | RunContext<TContext>;
-  maxTurns?: number;
+  maxTurns?: number | null;
   signal?: AbortSignal;
   previousResponseId?: string;
   conversationId?: string;
@@ -726,10 +726,15 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
               : new RunContext(options.context),
             input,
             startingAgent,
-            options.maxTurns ?? DEFAULT_MAX_TURNS,
+            options.maxTurns === undefined
+              ? DEFAULT_MAX_TURNS
+              : options.maxTurns,
           );
       if (isResumedState) {
         state._agentToolInvocation = undefined;
+        if (options.maxTurns !== undefined) {
+          state._maxTurns = options.maxTurns;
+        }
       }
       const sandboxRuntime = new SandboxRuntimeManager<TContext>({
         startingAgent,
@@ -1652,10 +1657,15 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
               : new RunContext(options.context),
             input as string | AgentInputItem[],
             agent,
-            options.maxTurns ?? DEFAULT_MAX_TURNS,
+            options.maxTurns === undefined
+              ? DEFAULT_MAX_TURNS
+              : options.maxTurns,
           );
       if (isResumedState) {
         state._agentToolInvocation = undefined;
+        if (options.maxTurns !== undefined) {
+          state._maxTurns = options.maxTurns;
+        }
       }
       const sandboxRuntime = new SandboxRuntimeManager<TContext>({
         startingAgent: agent,
@@ -1688,7 +1698,7 @@ export class Runner extends RunHooks<any, AgentOutputType<unknown>> {
       };
 
       // Setup defaults
-      result.maxTurns = streamOptions.maxTurns ?? state._maxTurns;
+      result.maxTurns = state._maxTurns;
 
       // Continue the stream loop without blocking
       const streamLoopPromise = this.#runStreamLoop(
