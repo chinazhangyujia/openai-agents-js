@@ -86,8 +86,10 @@ import {
  *   aliasing to serialized run state payloads.
  * - 1.9: Adds optional sandbox session persistence with a versioned session-state
  *   envelope for sandbox-agent resume.
+ * - 1.10: Adds optional stable agent identity keys so duplicate-name agent graphs can
+ *   serialize and resume without ambiguous name resolution.
  */
-export const CURRENT_SCHEMA_VERSION = '1.9' as const;
+export const CURRENT_SCHEMA_VERSION = '1.10' as const;
 const SUPPORTED_SCHEMA_VERSIONS = [
   '1.0',
   '1.1',
@@ -98,6 +100,7 @@ const SUPPORTED_SCHEMA_VERSIONS = [
   '1.6',
   '1.7',
   '1.8',
+  '1.9',
   CURRENT_SCHEMA_VERSION,
 ] as const;
 type SupportedSchemaVersion = (typeof SUPPORTED_SCHEMA_VERSIONS)[number];
@@ -112,7 +115,9 @@ type RunStateContextOverrideOptions<TContext> = {
 
 const serializedAgentSchema = z.object({
   name: z.string(),
+  identity: z.string().optional(),
 });
+type SerializedAgentReference = z.infer<typeof serializedAgentSchema>;
 
 const serializedSpanBase = z.object({
   object: z.literal('trace.span'),
@@ -582,11 +587,11 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
    */
   public _trace: Trace | null = null;
   /**
-   * Runtime-only tool_search-loaded tools, scoped by agent name and preserved across turns for
+   * Runtime-only tool_search-loaded tools, scoped by agent object and preserved across turns for
    * the lifetime of this in-memory run.
    */
-  public _toolSearchRuntimeToolsByAgentName = new Map<
-    string,
+  public _toolSearchRuntimeToolsByAgent = new Map<
+    Agent<any, any>,
     ToolSearchRuntimeToolState<TContext>
   >();
   /**
@@ -646,16 +651,16 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
   }
 
   private getOrCreateToolSearchRuntimeToolState(
-    agentName: string,
+    agent: Agent<any, any>,
   ): ToolSearchRuntimeToolState<TContext> {
-    let state = this._toolSearchRuntimeToolsByAgentName.get(agentName);
+    let state = this._toolSearchRuntimeToolsByAgent.get(agent);
     if (!state) {
       state = {
         anonymousEntries: [],
         keyedEntries: new Map(),
         nextOrder: 0,
       };
-      this._toolSearchRuntimeToolsByAgentName.set(agentName, state);
+      this._toolSearchRuntimeToolsByAgent.set(agent, state);
     }
     return state;
   }
@@ -665,7 +670,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
     toolSearchOutput: protocol.ToolSearchOutputItem,
     tools: Tool<TContext>[],
   ): void {
-    const runtimeState = this.getOrCreateToolSearchRuntimeToolState(agent.name);
+    const runtimeState = this.getOrCreateToolSearchRuntimeToolState(agent);
     const entry: ToolSearchRuntimeToolEntry<TContext> = {
       order: runtimeState.nextOrder++,
       tools,
@@ -680,9 +685,7 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
   }
 
   public getToolSearchRuntimeTools(agent: Agent<any, any>): Tool<TContext>[] {
-    const runtimeState = this._toolSearchRuntimeToolsByAgentName.get(
-      agent.name,
-    );
+    const runtimeState = this._toolSearchRuntimeToolsByAgent.get(agent);
     if (!runtimeState) {
       return [];
     }
@@ -865,16 +868,17 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
   toJSON(
     options: { includeTracingApiKey?: boolean } = {},
   ): z.infer<typeof SerializedRunState> {
-    buildAgentMap(this.#startingAgent);
+    const agentIdentity = buildAgentIdentityMap(this.#startingAgent);
 
     const includeTracingApiKey = options.includeTracingApiKey === true;
     const contextJson = this._context.toJSON();
     const output = {
       $schemaVersion: CURRENT_SCHEMA_VERSION,
       currentTurn: this._currentTurn,
-      currentAgent: {
-        name: this._currentAgent.name,
-      },
+      currentAgent: serializeAgentReference(
+        this._currentAgent,
+        agentIdentity.byAgent,
+      ),
       originalInput: this._originalInput as any,
       modelResponses: this._modelResponses.map((response) => {
         return {
@@ -908,7 +912,9 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
         };
       }),
       context: contextJson,
-      toolUseTracker: this._toolUseTracker.toJSON(),
+      toolUseTracker: this._toolUseTracker.toJSON({
+        agentIdentityKeys: agentIdentity.byAgent,
+      }),
       maxTurns: this._maxTurns,
       currentAgentSpan: this._currentAgentSpan?.toJSON() as any,
       noActiveAgentRun: this._noActiveAgentRun,
@@ -916,18 +922,28 @@ export class RunState<TContext, TAgent extends Agent<any, any>> {
       inputGuardrailResults: this._inputGuardrailResults,
       outputGuardrailResults: this._outputGuardrailResults.map((r) => ({
         ...r,
-        agent: r.agent.toJSON(),
+        agent: serializeAgentReference(r.agent, agentIdentity.byAgent),
       })),
       toolInputGuardrailResults: this._toolInputGuardrailResults,
       toolOutputGuardrailResults: this._toolOutputGuardrailResults,
-      currentStep: this._currentStep as any,
+      currentStep: serializeCurrentStep(
+        this._currentStep,
+        agentIdentity.byAgent,
+      ) as any,
       lastModelResponse: this._lastTurnResponse as any,
-      generatedItems: this._generatedItems.map((item) => item.toJSON() as any),
+      generatedItems: this._generatedItems.map(
+        (item) => serializeRunItem(item, agentIdentity.byAgent) as any,
+      ),
       pendingAgentToolRuns: Object.fromEntries(
         this._pendingAgentToolRuns.entries(),
       ),
       currentTurnPersistedItemCount: this._currentTurnPersistedItemCount,
-      lastProcessedResponse: this._lastProcessedResponse as any,
+      lastProcessedResponse: this._lastProcessedResponse
+        ? (serializeProcessedResponse(
+            this._lastProcessedResponse,
+            agentIdentity.byAgent,
+          ) as any)
+        : undefined,
       conversationId: this._conversationId,
       previousResponseId: this._previousResponseId,
       reasoningItemIdPolicy: this._reasoningItemIdPolicy,
@@ -1026,7 +1042,11 @@ function assertSchemaVersionSupportsToolSearch(
   schemaVersion: SupportedSchemaVersion,
   stateJson: z.infer<typeof SerializedRunState>,
 ): void {
-  if (schemaVersion === '1.8' || schemaVersion === '1.9') {
+  if (
+    schemaVersion === '1.8' ||
+    schemaVersion === '1.9' ||
+    schemaVersion === CURRENT_SCHEMA_VERSION
+  ) {
     return;
   }
 
@@ -1037,6 +1057,12 @@ function assertSchemaVersionSupportsToolSearch(
   throw new UserError(
     `Run state schema version ${schemaVersion} does not support tool_search items. Please reserialize the run state with schema ${CURRENT_SCHEMA_VERSION}.`,
   );
+}
+
+function schemaVersionSupportsAgentIdentity(
+  schemaVersion: SupportedSchemaVersion,
+): boolean {
+  return schemaVersion === CURRENT_SCHEMA_VERSION;
 }
 
 function containsSerializedToolSearchState(
@@ -1231,10 +1257,10 @@ function assertRuntimeToolKeysMatch<TContext>(args: {
 async function getConfiguredAgentTools<TContext>(args: {
   agent: Agent<TContext, any>;
   context: RunContext<TContext>;
-  configuredToolsByAgentName: Map<string, Tool<TContext>[]>;
+  configuredToolsByAgent: Map<Agent<TContext, any>, Tool<TContext>[]>;
 }): Promise<Tool<TContext>[]> {
-  const { agent, context, configuredToolsByAgentName } = args;
-  const existing = configuredToolsByAgentName.get(agent.name);
+  const { agent, context, configuredToolsByAgent } = args;
+  const existing = configuredToolsByAgent.get(agent);
   if (existing) {
     return existing;
   }
@@ -1242,7 +1268,7 @@ async function getConfiguredAgentTools<TContext>(args: {
   const configuredTools = (await agent.getAllTools(
     context,
   )) as Tool<TContext>[];
-  configuredToolsByAgentName.set(agent.name, configuredTools);
+  configuredToolsByAgent.set(agent, configuredTools);
   return configuredTools;
 }
 
@@ -1250,14 +1276,20 @@ async function rehydrateToolSearchRuntimeTools<
   TContext,
   TAgent extends Agent<any, any>,
 >(state: RunState<TContext, TAgent>): Promise<void> {
-  const configuredToolsByAgentName = new Map<string, Tool<TContext>[]>();
+  const configuredToolsByAgent = new Map<
+    Agent<TContext, any>,
+    Tool<TContext>[]
+  >();
   const pendingToolSearchCalls = new Map<
-    string,
-    {
-      agent: Agent<TContext, any>;
-      toolSearchCall: protocol.ToolSearchCallItem;
-      runtimeTools?: Tool<TContext>[];
-    }
+    Agent<TContext, any>,
+    Map<
+      string,
+      {
+        agent: Agent<TContext, any>;
+        toolSearchCall: protocol.ToolSearchCallItem;
+        runtimeTools?: Tool<TContext>[];
+      }
+    >
   >();
 
   for (const item of state._generatedItems) {
@@ -1267,10 +1299,22 @@ async function rehydrateToolSearchRuntimeTools<
       }
 
       const callId = resolveToolSearchCallId(item.rawItem);
-      pendingToolSearchCalls.set(`${item.agent.name}:${callId}`, {
+      const agent = item.agent as Agent<TContext, any>;
+      const pendingCallsById =
+        pendingToolSearchCalls.get(agent) ??
+        new Map<
+          string,
+          {
+            agent: Agent<TContext, any>;
+            toolSearchCall: protocol.ToolSearchCallItem;
+            runtimeTools?: Tool<TContext>[];
+          }
+        >();
+      pendingCallsById.set(callId, {
         agent: item.agent as Agent<TContext, any>,
         toolSearchCall: item.rawItem,
       });
+      pendingToolSearchCalls.set(agent, pendingCallsById);
       continue;
     }
 
@@ -1285,7 +1329,7 @@ async function rehydrateToolSearchRuntimeTools<
     const configuredTools = await getConfiguredAgentTools({
       agent: item.agent as Agent<TContext, any>,
       context: state._context,
-      configuredToolsByAgentName,
+      configuredToolsByAgent,
     });
     const configuredToolKeys = getRuntimeToolKeys(configuredTools, {
       allowUnsupported: true,
@@ -1300,9 +1344,9 @@ async function rehydrateToolSearchRuntimeTools<
     }
 
     const callId = resolveToolSearchCallId(item.rawItem);
-    const pendingCall = pendingToolSearchCalls.get(
-      `${item.agent.name}:${callId}`,
-    );
+    const pendingCall = pendingToolSearchCalls
+      .get(item.agent as Agent<TContext, any>)
+      ?.get(callId);
     if (!pendingCall) {
       throw new UserError(
         `RunState cannot resume custom client tool_search output ${callId} for agent ${item.agent.name} because the serialized state is missing the matching tool_search call item.`,
@@ -1366,7 +1410,11 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   stateJson: z.infer<typeof SerializedRunState>,
   options: RunStateContextOverrideOptions<TContext> = {},
 ): Promise<RunState<TContext, TAgent>> {
-  const agentMap = buildAgentMap(initialAgent);
+  const agentMap = schemaVersionSupportsAgentIdentity(
+    stateJson.$schemaVersion as SupportedSchemaVersion,
+  )
+    ? buildAgentIdentityMap(initialAgent).byIdentity
+    : buildAgentMap(initialAgent);
   const contextOverride = options.contextOverride;
   const contextStrategy = options.contextStrategy ?? 'merge';
 
@@ -1396,10 +1444,7 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   //
   // Find the current agent from the initial agent
   //
-  const currentAgent = agentMap.get(stateJson.currentAgent.name);
-  if (!currentAgent) {
-    throw new UserError(`Agent ${stateJson.currentAgent.name} not found`);
-  }
+  const currentAgent = resolveSerializedAgent(stateJson.currentAgent, agentMap);
 
   const state = new RunState<TContext, TAgent>(
     context,
@@ -1419,11 +1464,13 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   for (const [agentName, toolNames] of Object.entries(
     stateJson.toolUseTracker,
   )) {
-    state._toolUseTracker.addToolUse(
-      agentMap.get(agentName) as TAgent,
-      toolNames,
-      { allowEmpty: true },
-    );
+    const agent = agentMap.get(agentName);
+    if (!agent) {
+      throw new UserError(`Agent ${agentName} not found`);
+    }
+    state._toolUseTracker.addToolUse(agent as TAgent, toolNames, {
+      allowEmpty: true,
+    });
   }
 
   state._pendingAgentToolRuns = new Map(
@@ -1456,7 +1503,7 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
     stateJson.inputGuardrailResults as InputGuardrailResult[];
   state._outputGuardrailResults = stateJson.outputGuardrailResults.map((r) => ({
     ...r,
-    agent: agentMap.get(r.agent.name) as Agent<any, any>,
+    agent: resolveSerializedAgent(r.agent, agentMap),
   })) as OutputGuardrailResult<any, any>[];
   state._toolInputGuardrailResults =
     stateJson.toolInputGuardrailResults as ToolInputGuardrailResult[];
@@ -1491,7 +1538,10 @@ async function buildRunStateFromJson<TContext, TAgent extends Agent<any, any>>(
   if (stateJson.currentStep?.type === 'next_step_handoff') {
     state._currentStep = {
       type: 'next_step_handoff',
-      newAgent: agentMap.get(stateJson.currentStep.newAgent.name) as TAgent,
+      newAgent: resolveSerializedAgent(
+        stateJson.currentStep.newAgent,
+        agentMap,
+      ) as TAgent,
     };
   } else if (stateJson.currentStep?.type === 'next_step_interruption') {
     state._currentStep = {
@@ -1524,12 +1574,16 @@ export async function rehydrateProcessedResponseTools<
     return;
   }
 
+  const agentIdentity = buildAgentIdentityMap(initialAgent);
+  const serializedProcessedResponse = serializeProcessedResponse(
+    state._lastProcessedResponse,
+    agentIdentity.byAgent,
+  );
+
   state._lastProcessedResponse = await deserializeProcessedResponse(
-    buildAgentMap(initialAgent),
+    agentIdentity.byIdentity,
     state as RunState<TContext, Agent<any, any>>,
-    state._lastProcessedResponse as unknown as z.infer<
-      typeof serializedProcessedResponseSchema
-    >,
+    serializedProcessedResponse,
     {
       executionTools,
       allowSerializedExecutionToolPlaceholder: false,
@@ -1580,6 +1634,350 @@ export function buildAgentMap(
   }
 
   return map;
+}
+
+type AgentIdentityMap = {
+  byIdentity: Map<string, Agent<any, any>>;
+  byAgent: Map<Agent<any, any>, string>;
+};
+
+type TraversedAgent = {
+  agent: Agent<any, any>;
+  index: number;
+};
+
+/**
+ * @internal
+ */
+export function buildAgentIdentityMap(
+  initialAgent: Agent<any, any>,
+): AgentIdentityMap {
+  const agents = collectAgentGraph(initialAgent);
+  const groups = new Map<string, TraversedAgent[]>();
+  const literalNames = new Set<string>();
+
+  for (const entry of agents) {
+    literalNames.add(entry.agent.name);
+    const group = groups.get(entry.agent.name) ?? [];
+    group.push(entry);
+    groups.set(entry.agent.name, group);
+  }
+
+  const byIdentity = new Map<string, Agent<any, any>>();
+  const byAgent = new Map<Agent<any, any>, string>();
+  const usedIdentities = new Set<string>();
+
+  for (const [agentName, group] of groups) {
+    const sortedGroup =
+      group.length === 1
+        ? group
+        : [...group].sort((left, right) => {
+            if (left.agent === initialAgent) {
+              return -1;
+            }
+            if (right.agent === initialAgent) {
+              return 1;
+            }
+
+            const leftSignature = getAgentIdentitySignature(left.agent);
+            const rightSignature = getAgentIdentitySignature(right.agent);
+            if (leftSignature !== rightSignature) {
+              return leftSignature < rightSignature ? -1 : 1;
+            }
+
+            return left.index - right.index;
+          });
+
+    let nextSuffix = 0;
+    for (const { agent } of sortedGroup) {
+      let identity: string;
+      do {
+        identity =
+          nextSuffix === 0 ? agentName : `${agentName}#${nextSuffix + 1}`;
+        nextSuffix += 1;
+      } while (
+        usedIdentities.has(identity) ||
+        (identity !== agent.name && literalNames.has(identity))
+      );
+
+      usedIdentities.add(identity);
+      byIdentity.set(identity, agent);
+      byAgent.set(agent, identity);
+    }
+  }
+
+  return { byIdentity, byAgent };
+}
+
+function collectAgentGraph(initialAgent: Agent<any, any>): TraversedAgent[] {
+  const agents: TraversedAgent[] = [];
+  const visitedAgents = new Set<Agent<any, any>>();
+  const queue: Agent<any, any>[] = [initialAgent];
+
+  while (queue.length > 0) {
+    const currentAgent = queue.shift()!;
+    if (visitedAgents.has(currentAgent)) {
+      continue;
+    }
+    visitedAgents.add(currentAgent);
+    agents.push({ agent: currentAgent, index: agents.length });
+
+    for (const handoff of currentAgent.handoffs) {
+      if (handoff instanceof Agent) {
+        queue.push(handoff);
+      } else if (handoff.agent) {
+        queue.push(handoff.agent);
+      }
+    }
+
+    for (const tool of currentAgent.tools) {
+      const sourceAgent = getAgentToolSourceAgent(tool);
+      if (sourceAgent) {
+        queue.push(sourceAgent);
+      }
+    }
+  }
+
+  return agents;
+}
+
+function getAgentIdentitySignature(agent: Agent<any, any>): string {
+  const sandboxAgent = agent as Agent<any, any> & {
+    defaultManifest?: unknown;
+    baseInstructions?: unknown;
+    capabilities?: unknown[];
+    runAs?: unknown;
+  };
+  const signature = {
+    type: agent.constructor?.name,
+    name: agent.name,
+    handoffDescription: agent.handoffDescription,
+    instructions: summarizeIdentityValue(agent.instructions),
+    prompt: summarizeIdentityValue(agent.prompt),
+    model: summarizeIdentityValue(agent.model),
+    modelSettings: summarizeIdentityValue(agent.modelSettings),
+    tools: agent.tools.map(summarizeToolIdentity),
+    handoffs: agent.handoffs.map((entry) =>
+      entry instanceof Agent
+        ? { type: 'agent', name: entry.name }
+        : {
+            type: 'handoff',
+            toolName: entry.toolName,
+            agentName: entry.agentName,
+            targetName: entry.agent?.name,
+          },
+    ),
+    mcpServers: agent.mcpServers.map(summarizeIdentityValue),
+    inputGuardrails: agent.inputGuardrails.map(summarizeIdentityValue),
+    outputGuardrails: agent.outputGuardrails.map(summarizeIdentityValue),
+    outputType: summarizeIdentityValue(agent.outputType),
+    toolUseBehavior: summarizeIdentityValue(agent.toolUseBehavior),
+    resetToolChoice: agent.resetToolChoice,
+    defaultManifest: summarizeIdentityValue(sandboxAgent.defaultManifest),
+    baseInstructions: summarizeIdentityValue(sandboxAgent.baseInstructions),
+    capabilities: sandboxAgent.capabilities?.map(summarizeIdentityValue),
+    runAs: summarizeIdentityValue(sandboxAgent.runAs),
+  };
+
+  return stableStringify(signature);
+}
+
+function summarizeToolIdentity(tool: Tool<any>): unknown {
+  return {
+    type: tool.type,
+    name: (tool as { name?: unknown }).name,
+    namespace: (tool as { namespace?: unknown }).namespace,
+    strict: (tool as { strict?: unknown }).strict,
+    parameters: summarizeIdentityValue(
+      (tool as { parameters?: unknown }).parameters,
+    ),
+  };
+}
+
+function summarizeIdentityValue(value: unknown): unknown {
+  return normalizeForIdentity(value, new WeakSet(), 0);
+}
+
+function normalizeForIdentity(
+  value: unknown,
+  seen: WeakSet<object>,
+  depth: number,
+): unknown {
+  if (value === null || typeof value === 'undefined') {
+    return value;
+  }
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return value;
+  }
+  if (typeof value === 'function') {
+    return `[function:${value.name || 'anonymous'}]`;
+  }
+  if (typeof value !== 'object') {
+    return String(value);
+  }
+  if (seen.has(value)) {
+    return '[circular]';
+  }
+  if (depth >= 4) {
+    return `[${value.constructor?.name ?? 'Object'}]`;
+  }
+
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeForIdentity(item, seen, depth + 1));
+  }
+  if (value instanceof Map) {
+    return [...value.entries()]
+      .map(([key, entryValue]) => [
+        normalizeForIdentity(key, seen, depth + 1),
+        normalizeForIdentity(entryValue, seen, depth + 1),
+      ])
+      .sort((left, right) =>
+        stableStringify(left).localeCompare(stableStringify(right)),
+      );
+  }
+  if (value instanceof Set) {
+    return [...value.values()]
+      .map((entry) => normalizeForIdentity(entry, seen, depth + 1))
+      .sort((left, right) =>
+        stableStringify(left).localeCompare(stableStringify(right)),
+      );
+  }
+
+  const record = value as Record<string, unknown>;
+  const normalized: Record<string, unknown> = {
+    constructor: value.constructor?.name,
+  };
+  for (const key of Object.keys(record).sort()) {
+    normalized[key] = normalizeForIdentity(record[key], seen, depth + 1);
+  }
+  return normalized;
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, currentValue) => {
+    if (
+      !currentValue ||
+      typeof currentValue !== 'object' ||
+      Array.isArray(currentValue)
+    ) {
+      return currentValue;
+    }
+
+    return Object.fromEntries(
+      Object.entries(currentValue as Record<string, unknown>).sort(
+        ([left], [right]) => left.localeCompare(right),
+      ),
+    );
+  });
+}
+
+function serializeAgentReference(
+  agent: Agent<any, any>,
+  agentIdentityKeys: ReadonlyMap<Agent<any, any>, string>,
+): SerializedAgentReference {
+  const identity = agentIdentityKeys.get(agent);
+  if (!identity || identity === agent.name) {
+    return { name: agent.name };
+  }
+
+  return { name: agent.name, identity };
+}
+
+function resolveSerializedAgent(
+  serializedAgent: SerializedAgentReference,
+  agentMap: Map<string, Agent<any, any>>,
+  fallbackAgent?: Agent<any, any>,
+): Agent<any, any> {
+  const identity = serializedAgent.identity ?? serializedAgent.name;
+  const agent = agentMap.get(identity);
+  if (agent) {
+    return agent;
+  }
+  if (!serializedAgent.identity && fallbackAgent) {
+    return fallbackAgent;
+  }
+  if (serializedAgent.identity) {
+    throw new UserError(`Agent identity ${serializedAgent.identity} not found`);
+  }
+  throw new UserError(`Agent ${serializedAgent.name} not found`);
+}
+
+function serializeRunItem(
+  item: RunItem,
+  agentIdentityKeys: ReadonlyMap<Agent<any, any>, string>,
+): z.infer<typeof itemSchema> {
+  const serialized = item.toJSON() as any;
+  switch (item.type) {
+    case 'handoff_output_item':
+      serialized.sourceAgent = serializeAgentReference(
+        item.sourceAgent,
+        agentIdentityKeys,
+      );
+      serialized.targetAgent = serializeAgentReference(
+        item.targetAgent,
+        agentIdentityKeys,
+      );
+      return serialized;
+    default:
+      serialized.agent = serializeAgentReference(
+        (item as RunItem & { agent: Agent<any, any> }).agent,
+        agentIdentityKeys,
+      );
+      return serialized;
+  }
+}
+
+function serializeCurrentStep(
+  currentStep: NextStep | undefined,
+  agentIdentityKeys: ReadonlyMap<Agent<any, any>, string>,
+): NextStep | undefined {
+  if (!currentStep) {
+    return undefined;
+  }
+  if (currentStep.type === 'next_step_handoff') {
+    return {
+      ...currentStep,
+      newAgent: serializeAgentReference(
+        currentStep.newAgent as Agent<any, any>,
+        agentIdentityKeys,
+      ),
+    };
+  }
+  if (currentStep.type === 'next_step_interruption') {
+    const interruptions = Array.isArray(currentStep.data?.interruptions)
+      ? currentStep.data.interruptions.map((item: unknown) =>
+          item instanceof RunToolApprovalItem
+            ? serializeRunItem(item, agentIdentityKeys)
+            : item,
+        )
+      : currentStep.data?.interruptions;
+    return {
+      ...currentStep,
+      data: {
+        ...currentStep.data,
+        interruptions,
+      },
+    };
+  }
+
+  return currentStep;
+}
+
+function serializeProcessedResponse<TContext>(
+  processedResponse: ProcessedResponse<TContext>,
+  agentIdentityKeys: ReadonlyMap<Agent<any, any>, string>,
+): z.infer<typeof serializedProcessedResponseSchema> {
+  return {
+    ...processedResponse,
+    newItems: processedResponse.newItems.map((item) =>
+      serializeRunItem(item, agentIdentityKeys),
+    ),
+  } as z.infer<typeof serializedProcessedResponseSchema>;
 }
 
 /**
@@ -1640,49 +2038,49 @@ export function deserializeItem(
     case 'message_output_item':
       return new RunMessageOutputItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
       );
     case 'tool_search_call_item':
       return new RunToolSearchCallItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
       );
     case 'tool_search_output_item':
       return new RunToolSearchOutputItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
       );
     case 'tool_call_item':
       return new RunToolCallItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
       );
     case 'tool_call_output_item':
       return new RunToolCallOutputItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
         serializedItem.output,
       );
     case 'reasoning_item':
       return new RunReasoningItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
       );
     case 'handoff_call_item':
       return new RunHandoffCallItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
       );
     case 'handoff_output_item':
       return new RunHandoffOutputItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.sourceAgent.name) as Agent<any, any>,
-        agentMap.get(serializedItem.targetAgent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.sourceAgent, agentMap),
+        resolveSerializedAgent(serializedItem.targetAgent, agentMap),
       );
     case 'tool_approval_item':
       return new RunToolApprovalItem(
         serializedItem.rawItem,
-        agentMap.get(serializedItem.agent.name) as Agent<any, any>,
+        resolveSerializedAgent(serializedItem.agent, agentMap),
         serializedItem.toolName,
       );
   }
@@ -1700,7 +2098,11 @@ function deserializeInterruptionItem(
   const parsed = itemSchema.safeParse(serializedItem);
   if (parsed.success) {
     if (parsed.data.type === 'tool_approval_item') {
-      const mappedAgent = agentMap.get(parsed.data.agent.name) ?? currentAgent;
+      const mappedAgent = resolveSerializedAgent(
+        parsed.data.agent,
+        agentMap,
+        currentAgent,
+      );
       return new RunToolApprovalItem(
         parsed.data.rawItem,
         mappedAgent,
@@ -1719,7 +2121,7 @@ function deserializeInterruptionItem(
   const value = serializedItem as {
     rawItem?: unknown;
     toolName?: unknown;
-    agent?: { name?: unknown };
+    agent?: { name?: unknown; identity?: unknown };
   };
 
   if (!value.rawItem || typeof value.rawItem !== 'object') {
@@ -1741,8 +2143,21 @@ function deserializeInterruptionItem(
     value.agent && typeof value.agent.name === 'string'
       ? value.agent.name
       : undefined;
+  const agentIdentity =
+    value.agent && typeof value.agent.identity === 'string'
+      ? value.agent.identity
+      : undefined;
   const mappedAgent =
-    (agentName ? agentMap.get(agentName) : undefined) ?? currentAgent;
+    agentName || agentIdentity
+      ? resolveSerializedAgent(
+          {
+            name: agentName ?? currentAgent.name,
+            identity: agentIdentity,
+          },
+          agentMap,
+          currentAgent,
+        )
+      : currentAgent;
   const toolName =
     typeof value.toolName === 'string'
       ? value.toolName
