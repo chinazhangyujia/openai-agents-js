@@ -341,7 +341,8 @@ function normalizeTypography(content: string): string {
   return content
     .replaceAll('\u2026', '...')
     .replace(/[\u201c\u201d]/g, '"')
-    .replace(/[\u2018\u2019]/g, "'");
+    .replace(/[\u2018\u2019]/g, "'")
+    .replaceAll('\\/>', '/>');
 }
 
 function buildInstructionsForTitle(
