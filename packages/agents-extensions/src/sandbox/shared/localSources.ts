@@ -1,6 +1,9 @@
 import { UserError } from '@openai/agents-core';
 import { type Entry, type Manifest } from '@openai/agents-core/sandbox';
-import { isHostPathStrictlyWithinRoot } from '@openai/agents-core/sandbox/internal';
+import {
+  isHostPathStrictlyWithinRoot,
+  isHostPathWithinRoot,
+} from '@openai/agents-core/sandbox/internal';
 import { constants, type Dirent, type Stats } from 'node:fs';
 import {
   lstat,
@@ -20,6 +23,7 @@ import {
   applyMaterializedManifestToState,
   materializeInlineManifestEntry,
   materializeManifestEntries,
+  mergeManifestDelta,
   resolveLocalDirFileConcurrency,
   resolveMaterializedChildPath,
   runLimited,
@@ -62,7 +66,10 @@ export async function applyLocalSourceManifestEntryToState(
     writer,
     resolvePath,
     materializeLocalSourceManifestEntry,
-    options,
+    {
+      ...options,
+      localSourceGrants: state.manifest.extraPathGrants,
+    },
   );
 }
 
@@ -74,6 +81,7 @@ export async function applyLocalSourceManifestToState(
   resolvePath: RemoteSandboxPathResolver,
   options: ManifestMaterializationOptions = {},
 ): Promise<void> {
+  const sourceManifest = mergeManifestDelta(state.manifest, manifest);
   await applyMaterializedManifestToState(
     state,
     manifest,
@@ -81,7 +89,10 @@ export async function applyLocalSourceManifestToState(
     writer,
     resolvePath,
     materializeLocalSourceManifestEntry,
-    options,
+    {
+      ...options,
+      localSourceGrants: sourceManifest.extraPathGrants,
+    },
   );
 }
 
@@ -98,7 +109,10 @@ export async function materializeLocalSourceManifest(
     providerLabel,
     resolvePath,
     materializeLocalSourceManifestEntry,
-    options,
+    {
+      ...options,
+      localSourceGrants: manifest.extraPathGrants,
+    },
   );
 }
 
@@ -135,11 +149,18 @@ export async function materializeLocalSourceManifestEntry(
     case 'local_file':
       await writer.writeFile(
         absolutePath,
-        await readStableLocalFile(entry.src),
+        await readStableLocalFile(
+          resolveLocalSourcePath('local_file', entry.src, options),
+        ),
       );
       break;
     case 'local_dir':
-      await materializeLocalDirectory(writer, absolutePath, entry.src, options);
+      await materializeLocalDirectory(
+        writer,
+        absolutePath,
+        resolveLocalSourcePath('local_dir', entry.src, options),
+        options,
+      );
       break;
     case 'git_repo':
       await materializeGitRepo(
@@ -163,6 +184,27 @@ export async function materializeLocalSourceManifestEntry(
   }
 
   await options.applyMetadata?.(absolutePath, entry);
+}
+
+function resolveLocalSourcePath(
+  entryType: 'local_dir' | 'local_file',
+  sourcePath: string,
+  options: ManifestMaterializationOptions,
+): string {
+  const base = resolve(options.localSourceBaseDir ?? process.cwd());
+  const resolvedSourcePath = resolve(base, sourcePath);
+  if (
+    isHostPathWithinRoot(base, resolvedSourcePath) ||
+    (options.localSourceGrants ?? []).some((grant) =>
+      isHostPathWithinRoot(resolve(grant.path), resolvedSourcePath),
+    )
+  ) {
+    return resolvedSourcePath;
+  }
+
+  throw new UserError(
+    `${entryType} source must stay within the local source base directory or manifest.extraPathGrants: ${resolvedSourcePath} (base: ${base})`,
+  );
 }
 
 async function materializeLocalDirectory(

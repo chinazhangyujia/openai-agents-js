@@ -283,6 +283,7 @@ describe('UnixLocalSandboxClient', () => {
     await expect(
       client.create(
         new Manifest({
+          extraPathGrants: [{ path: sourceDir, readOnly: true }],
           entries: {
             data: {
               type: 'local_dir',
@@ -307,6 +308,7 @@ describe('UnixLocalSandboxClient', () => {
     await expect(
       client.create(
         new Manifest({
+          extraPathGrants: [{ path: rootDir, readOnly: true }],
           entries: {
             copied: {
               type: 'local_file',
@@ -331,6 +333,7 @@ describe('UnixLocalSandboxClient', () => {
     await expect(
       client.create(
         new Manifest({
+          extraPathGrants: [{ path: rootDir, readOnly: true }],
           entries: {
             copied: {
               type: 'local_file',
@@ -357,6 +360,7 @@ describe('UnixLocalSandboxClient', () => {
     await expect(
       client.create(
         new Manifest({
+          extraPathGrants: [{ path: rootDir, readOnly: true }],
           entries: {
             data: {
               type: 'local_dir',
@@ -405,6 +409,106 @@ describe('UnixLocalSandboxClient', () => {
         }),
       ),
     ).rejects.toThrow(/Sandbox concurrency limits must be positive numbers/);
+  });
+
+  it('rejects local_file sources outside the local source base directory without a grant', async () => {
+    const outside = join(rootDir, 'outside');
+    const workspaceRootPath = join(rootDir, 'workspace');
+    await mkdir(outside);
+    await writeFile(join(outside, 'secret.txt'), 'secret');
+
+    await expect(
+      materializeLocalWorkspaceManifest(
+        new Manifest({
+          entries: {
+            copied: {
+              type: 'local_file',
+              src: join(outside, 'secret.txt'),
+            },
+          },
+        }),
+        workspaceRootPath,
+      ),
+    ).rejects.toThrow(/local_file source must stay within/);
+
+    await expect(
+      readFile(join(workspaceRootPath, 'copied'), 'utf8'),
+    ).rejects.toThrow();
+  });
+
+  it('allows local_file sources outside the local source base directory with a grant', async () => {
+    const outside = join(rootDir, 'outside-granted');
+    const workspaceRootPath = join(rootDir, 'workspace');
+    await mkdir(outside);
+    await writeFile(join(outside, 'secret.txt'), 'secret');
+
+    await materializeLocalWorkspaceManifest(
+      new Manifest({
+        extraPathGrants: [{ path: outside, readOnly: true }],
+        entries: {
+          copied: {
+            type: 'local_file',
+            src: join(outside, 'secret.txt'),
+          },
+        },
+      }),
+      workspaceRootPath,
+    );
+
+    await expect(
+      readFile(join(workspaceRootPath, 'copied'), 'utf8'),
+    ).resolves.toBe('secret');
+  });
+
+  it('allows local_dir sources inside the local source base directory without a grant', async () => {
+    const base = join(rootDir, 'base');
+    const source = join(base, 'source');
+    const workspaceRootPath = join(rootDir, 'workspace');
+    await mkdir(source, { recursive: true });
+    await writeFile(join(source, 'safe.txt'), 'safe');
+
+    await materializeLocalWorkspaceManifest(
+      new Manifest({
+        entries: {
+          copied: {
+            type: 'local_dir',
+            src: source,
+          },
+        },
+      }),
+      workspaceRootPath,
+      {
+        localSourceBaseDir: base,
+      },
+    );
+
+    await expect(
+      readFile(join(workspaceRootPath, 'copied', 'safe.txt'), 'utf8'),
+    ).resolves.toBe('safe');
+  });
+
+  it('allows local_dir sources outside the local source base directory with a grant', async () => {
+    const outside = join(rootDir, 'absolute-outside');
+    const workspaceRootPath = join(rootDir, 'workspace');
+    await mkdir(outside);
+    await writeFile(join(outside, 'secret.txt'), 'secret');
+
+    await materializeLocalWorkspaceManifest(
+      new Manifest({
+        extraPathGrants: [{ path: outside, readOnly: true }],
+        entries: {
+          copied: {
+            type: 'local_dir',
+            src: outside,
+          },
+        },
+      }),
+      workspaceRootPath,
+    );
+
+    await expect(
+      readFile(join(workspaceRootPath, 'copied', 'secret.txt'), 'utf8'),
+    ).resolves.toBe('secret');
   });
 
   it('applies explicit entry permissions during materialization', async () => {
@@ -2159,7 +2263,11 @@ void main();
     const client = new UnixLocalSandboxClient({
       workspaceBaseDir: rootDir,
     });
-    const session = await client.create(new Manifest());
+    const session = await client.create(
+      new Manifest({
+        extraPathGrants: [{ path: skillsRoot, readOnly: true }],
+      }),
+    );
     const capability = skills({
       lazyFrom: {
         source: {

@@ -1,4 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -336,13 +342,16 @@ describe('Skills', () => {
       const capability = skills({
         lazyFrom: localDirLazySkillSource(skillsRoot),
       });
-      const instructions = await capability.instructions(new Manifest());
+      const manifest = new Manifest({
+        extraPathGrants: [{ path: skillsRoot, readOnly: true }],
+      });
+      const instructions = await capability.instructions(manifest);
 
       expect(instructions).toContain(
         '- spreadsheet-review: Review spreadsheets quickly (file: .agents/sheet-tools)',
       );
 
-      const session = new FakeSkillsSession();
+      const session = new FakeSkillsSession(manifest);
       capability.bind(session);
       const [tool] = capability.tools();
 
@@ -366,6 +375,140 @@ describe('Skills', () => {
           runAs: undefined,
         },
       ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not discover lazy local directory metadata outside the base directory without a grant', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'agents-skills-outside-'));
+    try {
+      const skillsRoot = join(root, 'skills');
+      const skillDir = join(skillsRoot, 'hidden-skill');
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(
+        join(skillDir, 'SKILL.md'),
+        [
+          '---',
+          'name: hidden-skill',
+          'description: Outside the base directory',
+          '---',
+          '# Hidden skill',
+        ].join('\n'),
+        'utf8',
+      );
+
+      const capability = skills({
+        lazyFrom: localDirLazySkillSource(skillsRoot),
+      });
+      const instructions = await capability.instructions(new Manifest());
+
+      expect(instructions).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('discovers lazy local directory metadata outside the base directory with a grant', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'agents-skills-granted-'));
+    try {
+      const skillsRoot = join(root, 'skills');
+      const skillDir = join(skillsRoot, 'hidden-skill');
+      mkdirSync(skillDir, { recursive: true });
+      writeFileSync(
+        join(skillDir, 'SKILL.md'),
+        [
+          '---',
+          'name: hidden-skill',
+          'description: Outside the base directory',
+          '---',
+          '# Hidden skill',
+        ].join('\n'),
+        'utf8',
+      );
+
+      const capability = skills({
+        lazyFrom: localDirLazySkillSource(skillsRoot),
+      });
+      const instructions = await capability.instructions(
+        new Manifest({
+          extraPathGrants: [{ path: skillsRoot, readOnly: true }],
+        }),
+      );
+
+      expect(instructions).toContain(
+        '- hidden-skill: Outside the base directory (file: .agents/hidden-skill)',
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not discover lazy local directory metadata through a symlinked source', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'agents-skills-symlink-'));
+    try {
+      const base = join(root, 'base');
+      const outsideSkillsRoot = join(root, 'outside-skills');
+      const outsideSkillDir = join(outsideSkillsRoot, 'hidden-skill');
+      mkdirSync(base);
+      mkdirSync(outsideSkillDir, { recursive: true });
+      writeFileSync(
+        join(outsideSkillDir, 'SKILL.md'),
+        [
+          '---',
+          'name: hidden-skill',
+          'description: Outside the base directory',
+          '---',
+          '# Hidden skill',
+        ].join('\n'),
+        'utf8',
+      );
+      symlinkSync(outsideSkillsRoot, join(base, 'skills'), 'dir');
+
+      const capability = skills({
+        lazyFrom: localDirLazySkillSource({
+          src: 'skills',
+          baseDir: base,
+        }),
+      });
+      const instructions = await capability.instructions(new Manifest());
+
+      expect(instructions).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not discover lazy local directory metadata through a symlinked SKILL.md', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'agents-skills-file-symlink-'));
+    try {
+      const base = join(root, 'base');
+      const skillDir = join(base, 'skills', 'hidden-skill');
+      const outside = join(root, 'outside');
+      mkdirSync(skillDir, { recursive: true });
+      mkdirSync(outside);
+      writeFileSync(
+        join(outside, 'SKILL.md'),
+        [
+          '---',
+          'name: hidden-skill',
+          'description: Outside the base directory',
+          '---',
+          '# Hidden skill',
+        ].join('\n'),
+        'utf8',
+      );
+      symlinkSync(join(outside, 'SKILL.md'), join(skillDir, 'SKILL.md'));
+
+      const capability = skills({
+        lazyFrom: localDirLazySkillSource({
+          src: 'skills',
+          baseDir: base,
+        }),
+      });
+      const instructions = await capability.instructions(new Manifest());
+
+      expect(instructions).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -32,7 +32,9 @@ const agent = new SandboxAgent({
   capabilities: [
     ...Capabilities.default(),
     skills({
-      lazyFrom: localDirLazySkillSource(hostSkillsDir),
+      lazyFrom: localDirLazySkillSource({
+        src: hostSkillsDir,
+      }),
     }),
   ],
 });
