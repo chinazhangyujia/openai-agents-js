@@ -1073,6 +1073,7 @@ describe('TraceProvider disabled behavior', () => {
 
     const trace = provider.createTrace({ name: 'disabled' });
     expect(trace).toBeInstanceOf(NoopTrace);
+    expect(trace.traceId).toBe('no-op');
 
     const span = provider.createSpan(
       {
@@ -1089,6 +1090,9 @@ describe('TraceProvider span creation without parents', () => {
     const loggerError = vi
       .spyOn(coreLogger, 'error')
       .mockImplementation(() => {});
+    const loggerDebug = vi
+      .spyOn(coreLogger, 'debug')
+      .mockImplementation(() => {});
     const provider = new TraceProvider();
     provider.setDisabled(false);
 
@@ -1096,6 +1100,11 @@ describe('TraceProvider span creation without parents', () => {
       data: { type: 'custom', name: 'no-trace', data: {} },
     });
     expect(span).toBeInstanceOf(NoopSpan);
+    expect(loggerDebug).toHaveBeenCalledWith(
+      'No active trace. Make sure to start a trace with `withTrace()` first. Returning NoopSpan.',
+    );
+    expect(loggerError).not.toHaveBeenCalled();
+    loggerDebug.mockRestore();
     loggerError.mockRestore();
   });
 
@@ -1126,6 +1135,16 @@ describe('TraceProvider span creation without parents', () => {
     );
     expect(fromTrace).toBeInstanceOf(NoopSpan);
 
+    const traceWithNoopId = new Trace({
+      name: 'noop-trace-id',
+      traceId: 'no-op',
+    });
+    const fromTraceId = provider.createSpan(
+      { data: { type: 'custom', name: 'noop-trace-id', data: {} } },
+      traceWithNoopId,
+    );
+    expect(fromTraceId).toBeInstanceOf(NoopSpan);
+
     const noopSpan = new NoopSpan(
       { type: 'custom', name: 'noop-span', data: {} },
       new TestProcessor(),
@@ -1135,6 +1154,52 @@ describe('TraceProvider span creation without parents', () => {
       noopSpan,
     );
     expect(fromSpan).toBeInstanceOf(NoopSpan);
+  });
+
+  it('returns NoopSpan when the span id is the no-op sentinel', async () => {
+    const provider = getGlobalTraceProvider();
+    provider.setDisabled(false);
+
+    await withTrace('active-trace', async () => {
+      const span = provider.createSpan({
+        data: { type: 'custom', name: 'noop-id', data: {} },
+        spanId: 'no-op',
+      });
+      expect(span).toBeInstanceOf(NoopSpan);
+    });
+
+    provider.setDisabled(true);
+  });
+
+  it('returns NoopSpan when the parent span id is the no-op sentinel', async () => {
+    const provider = getGlobalTraceProvider();
+    provider.setDisabled(false);
+
+    await withTrace('active-trace', async () => {
+      const currentTrace = getCurrentTrace();
+      expect(currentTrace).not.toBeNull();
+
+      const parentSpan = new Span(
+        {
+          traceId: currentTrace!.traceId,
+          spanId: 'no-op',
+          data: { type: 'custom', name: 'noop-parent-id', data: {} },
+        },
+        new TestProcessor(),
+      );
+      setCurrentSpan(parentSpan);
+
+      try {
+        const span = provider.createSpan({
+          data: { type: 'custom', name: 'child', data: {} },
+        });
+        expect(span).toBeInstanceOf(NoopSpan);
+      } finally {
+        resetCurrentSpan();
+      }
+    });
+
+    provider.setDisabled(true);
   });
 
   it('returns NoopSpan when span options are disabled', () => {
