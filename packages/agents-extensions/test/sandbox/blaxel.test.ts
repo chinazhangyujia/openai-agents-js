@@ -1,5 +1,7 @@
 import {
   Manifest,
+  SandboxWorkspaceArchiveReadError,
+  SandboxWorkspaceReadNotFoundError,
   SandboxProviderError,
   SandboxUnsupportedFeatureError,
   type Mount,
@@ -383,7 +385,7 @@ describe('BlaxelSandboxClient', () => {
     expect(processExecMock).toHaveBeenCalledWith(
       expect.objectContaining({
         command: "mkdir -p -- '/workspace'",
-        timeout: 404,
+        timeout: 1,
       }),
     );
 
@@ -392,16 +394,58 @@ describe('BlaxelSandboxClient', () => {
       command: 'ls',
       workingDir: '/workspace',
       waitForCompletion: true,
-      timeout: 202,
+      timeout: 1,
     });
 
     await expect(session.persistWorkspace()).rejects.toThrow();
     expect(
       processExecMock.mock.calls.some((call) => {
         const params = call[0] as { command?: string; timeout?: number };
-        return params.command?.includes('tar') && params.timeout === 303;
+        return params.command?.includes('tar') && params.timeout === 1;
       }),
     ).toBe(true);
+  });
+
+  test('converts provider exec timeouts from milliseconds to Blaxel seconds', async () => {
+    const client = new BlaxelSandboxClient({
+      timeouts: {
+        execTimeoutMs: 2501,
+      },
+    });
+    const session = await client.create(new Manifest());
+
+    await session.execCommand({ cmd: 'sleep 30' });
+
+    expect(processExecMock).toHaveBeenLastCalledWith({
+      command: 'sleep 30',
+      workingDir: '/workspace',
+      waitForCompletion: true,
+      timeout: 3,
+    });
+  });
+
+  test('wraps missing file reads into typed sandbox not-found errors', async () => {
+    const client = new BlaxelSandboxClient();
+    const session = await client.create(new Manifest());
+    readBinaryMock.mockRejectedValueOnce(
+      new Error(
+        '{"error":"stat /workspace/missing.txt: no such file or directory","status":"error"}',
+      ),
+    );
+
+    await expect(
+      session.readFile({ path: 'missing.txt' }),
+    ).rejects.toBeInstanceOf(SandboxWorkspaceReadNotFoundError);
+  });
+
+  test('wraps other file read failures into typed archive read errors', async () => {
+    const client = new BlaxelSandboxClient();
+    const session = await client.create(new Manifest());
+    readBinaryMock.mockRejectedValueOnce(new Error('read transport failed'));
+
+    await expect(
+      session.readFile({ path: 'README.md' }),
+    ).rejects.toBeInstanceOf(SandboxWorkspaceArchiveReadError);
   });
 
   test('enforces Blaxel file operation timeouts locally', async () => {
@@ -706,6 +750,62 @@ describe('BlaxelSandboxClient', () => {
     expect(getMock).toHaveBeenCalledWith(session.state.sandboxName);
   });
 
+  test('uses canonical sandbox metadata for owned pauseOnExit resume identity', async () => {
+    createSandboxMock.mockResolvedValueOnce(
+      makeSandbox({
+        metadata: {
+          name: 'blaxel-test',
+          createdAt: '2026-04-28T00:00:00.123Z',
+          workspace: 'test-workspace',
+          createdBy: 'test-user',
+        },
+      }),
+    );
+    getMock.mockResolvedValue(
+      makeSandbox({
+        metadata: {
+          name: 'blaxel-test',
+          createdAt: '2026-04-28T00:00:00.000Z',
+          workspace: 'test-workspace',
+          createdBy: 'test-user',
+        },
+      }),
+    );
+    const client = new BlaxelSandboxClient({
+      pauseOnExit: true,
+    } satisfies BlaxelSandboxClientOptions);
+
+    const session = await client.create(new Manifest());
+    await session.shutdown({
+      reason: 'cleanup',
+      preserveOwnedSessions: true,
+    });
+    await session.delete({
+      reason: 'cleanup',
+      preserveOwnedSessions: true,
+    });
+    await client.resume(session.state);
+
+    expect(session.state.sandboxIdentity).toContain('2026-04-28T00:00:00.000Z');
+    expect(deleteMock).not.toHaveBeenCalled();
+  });
+
+  test('rejects owned pauseOnExit creation when canonical identity lookup fails', async () => {
+    getMock.mockRejectedValueOnce(new Error('lookup failed'));
+    const client = new BlaxelSandboxClient({
+      name: 'blaxel-test',
+      pauseOnExit: true,
+    } satisfies BlaxelSandboxClientOptions);
+
+    await expect(client.create(new Manifest())).rejects.toThrow(
+      'cannot be safely preserved because its identity could not be verified after create',
+    );
+
+    expect(createSandboxMock).toHaveBeenCalledOnce();
+    expect(getMock).toHaveBeenCalledWith('blaxel-test');
+    expect(deleteMock).toHaveBeenCalledOnce();
+  });
+
   test('rejects owned resume when sandbox identity cannot be verified', async () => {
     const client = new BlaxelSandboxClient({
       pauseOnExit: true,
@@ -905,12 +1005,43 @@ describe('BlaxelSandboxClient', () => {
     expect(deleteMock).toHaveBeenCalledOnce();
   });
 
+  test('cleanup lifecycle preserves pauseOnExit sandboxes when requested', async () => {
+    const client = new BlaxelSandboxClient({
+      pauseOnExit: true,
+    } satisfies BlaxelSandboxClientOptions);
+    const session = await client.create(new Manifest());
+
+    await session.shutdown({
+      reason: 'cleanup',
+      preserveOwnedSessions: true,
+    });
+    await session.delete({
+      reason: 'cleanup',
+      preserveOwnedSessions: true,
+    });
+
+    expect(deleteMock).not.toHaveBeenCalled();
+  });
+
+  test('cleanup lifecycle kills pauseOnExit sandboxes unless preservation is requested', async () => {
+    const client = new BlaxelSandboxClient({
+      pauseOnExit: true,
+    } satisfies BlaxelSandboxClientOptions);
+    const session = await client.create(new Manifest());
+
+    await session.shutdown({ reason: 'cleanup' });
+    await session.delete({ reason: 'cleanup' });
+
+    expect(deleteMock).toHaveBeenCalledOnce();
+  });
+
   test('recreates by sandbox name when resume lookup reports missing sandbox', async () => {
     const client = new BlaxelSandboxClient({
       pauseOnExit: true,
     } satisfies BlaxelSandboxClientOptions);
     const session = await client.create(new Manifest());
     createSandboxMock.mockClear();
+    getMock.mockClear();
     getMock.mockRejectedValueOnce(new Error('sandbox missing'));
 
     const recreated = await client.resume(session.state);
@@ -926,6 +1057,7 @@ describe('BlaxelSandboxClient', () => {
     } satisfies BlaxelSandboxClientOptions);
     const session = await client.create(new Manifest());
     createSandboxMock.mockClear();
+    getMock.mockClear();
     getMock.mockRejectedValueOnce(new Error('sandbox missing'));
     createSandboxMock.mockRejectedValueOnce(sandboxAlreadyExistsError());
 
@@ -943,6 +1075,7 @@ describe('BlaxelSandboxClient', () => {
     } satisfies BlaxelSandboxClientOptions);
     const session = await client.create(new Manifest());
     createSandboxMock.mockClear();
+    getMock.mockClear();
     getMock.mockResolvedValueOnce(
       makeSandbox({
         name: session.state.sandboxName,
@@ -969,6 +1102,7 @@ describe('BlaxelSandboxClient', () => {
     } satisfies BlaxelSandboxClientOptions);
     const session = await client.create(new Manifest());
     createSandboxMock.mockClear();
+    getMock.mockClear();
     getMock.mockResolvedValueOnce(
       makeSandbox({
         name: session.state.sandboxName,
@@ -992,6 +1126,7 @@ describe('BlaxelSandboxClient', () => {
       } satisfies BlaxelSandboxClientOptions);
       const session = await client.create(new Manifest());
       createSandboxMock.mockClear();
+      getMock.mockClear();
       getMock.mockResolvedValueOnce(
         makeSandbox({
           name: session.state.sandboxName,
