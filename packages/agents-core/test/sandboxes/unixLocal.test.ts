@@ -739,6 +739,56 @@ describe('UnixLocalSandboxClient', () => {
     await session.close();
   });
 
+  it('rejects local workspace archive hydration over resource limits', async () => {
+    const client = new UnixLocalSandboxClient({
+      workspaceBaseDir: rootDir,
+    });
+    const session = await client.create(
+      new Manifest({
+        entries: {
+          'one.txt': {
+            type: 'file',
+            content: '1',
+          },
+          'two.txt': {
+            type: 'file',
+            content: '2',
+          },
+        },
+      }),
+    );
+
+    const archive = await session.persistWorkspace();
+
+    await expect(
+      session.hydrateWorkspace(archive, {
+        archiveLimits: {
+          maxInputBytes: null,
+          maxExtractedBytes: null,
+          maxMembers: 1,
+        },
+      }),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'archive member count exceeds limit',
+        limit: 1,
+        actual: 2,
+        member: 'two.txt',
+      },
+    });
+    await expect(
+      session.hydrateWorkspace(archive, {
+        archiveLimits: {
+          maxInputBytes: null,
+          maxExtractedBytes: null,
+          maxMembers: 2,
+        },
+      }),
+    ).resolves.toBeUndefined();
+
+    await session.close();
+  });
+
   it('rejects read-only local bind mounts because host symlinks cannot enforce them', async () => {
     const sourceDir = join(rootDir, 'bind-source');
     await mkdir(sourceDir);
@@ -2232,6 +2282,49 @@ void main();
     await expect(
       readFile(join(restored.state.workspaceRootPath, 'skip.txt'), 'utf8'),
     ).rejects.toThrow();
+  });
+
+  it('applies archive limits before restoring remote snapshots', async () => {
+    const store = new InMemoryRemoteSnapshotStore();
+    const client = new UnixLocalSandboxClient({
+      workspaceBaseDir: rootDir,
+      snapshot: {
+        type: 'remote',
+        id: 'remote-snapshot',
+        store,
+      },
+      archiveLimits: {
+        maxInputBytes: null,
+        maxExtractedBytes: 4,
+        maxMembers: null,
+      },
+    });
+    const session = await client.create(
+      new Manifest({
+        entries: {
+          'keep.txt': {
+            type: 'file',
+            content: 'keep\n',
+          },
+        },
+      }),
+    );
+
+    const serialized = JSON.parse(
+      JSON.stringify(await client.serializeSessionState(session.state)),
+    ) as Record<string, unknown>;
+    await rm(session.state.workspaceRootPath, { recursive: true, force: true });
+
+    await expect(
+      client.resume(await client.deserializeSessionState(serialized)),
+    ).rejects.toMatchObject({
+      details: {
+        reason: 'archive extracted size exceeds limit',
+        limit: 4,
+        actual: 5,
+        member: 'keep.txt',
+      },
+    });
   });
 
   it('rejects restoring remote snapshots into a symlinked workspace root', async () => {

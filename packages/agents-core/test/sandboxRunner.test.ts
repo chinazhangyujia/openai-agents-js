@@ -249,11 +249,15 @@ class FakeSandboxClient implements SandboxClient<
     options?: SandboxClientOptions;
     snapshot?: SandboxClientCreateArgs['snapshot'];
     concurrencyLimits?: SandboxClientCreateArgs['concurrencyLimits'];
+    archiveLimits?: SandboxClientCreateArgs['archiveLimits'];
   }> = [];
   readonly rawCreateCalls: Array<
     SandboxClientCreateArgs<SandboxClientOptions> | Manifest | undefined
   > = [];
-  readonly resumeCalls: Array<{ state: FakeSandboxSessionState }> = [];
+  readonly resumeCalls: Array<{
+    state: FakeSandboxSessionState;
+    archiveLimits?: SandboxClientCreateArgs['archiveLimits'];
+  }> = [];
   readonly serializedStates: Array<FakeSandboxSessionState> = [];
   readonly serializedOptions: SandboxSessionSerializationOptions[] = [];
   readonly closeCalls: string[] = [];
@@ -276,13 +280,14 @@ class FakeSandboxClient implements SandboxClient<
     manifestOptions?: SandboxClientOptions,
   ): Promise<SandboxSessionLike<FakeSandboxSessionState>> {
     this.rawCreateCalls.push(args);
-    const { manifest, options, snapshot, concurrencyLimits } =
+    const { manifest, options, snapshot, concurrencyLimits, archiveLimits } =
       normalizeSandboxClientCreateArgs(args, manifestOptions);
     this.createCalls.push({
       manifest,
       options,
       snapshot,
       concurrencyLimits,
+      archiveLimits,
     });
     const session = this.makeSession({
       manifest,
@@ -294,8 +299,9 @@ class FakeSandboxClient implements SandboxClient<
 
   async resume(
     state: FakeSandboxSessionState,
+    options: { archiveLimits?: SandboxClientCreateArgs['archiveLimits'] } = {},
   ): Promise<SandboxSessionLike<FakeSandboxSessionState>> {
-    this.resumeCalls.push({ state });
+    this.resumeCalls.push({ state, archiveLimits: options.archiveLimits });
     const session = this.makeSession(state);
     this.resumedSessions.push(session);
     return session;
@@ -1270,7 +1276,7 @@ describe('sandbox runner integration', () => {
     ]);
   });
 
-  it('passes run-level snapshot and concurrency settings through sandbox client options', async () => {
+  it('passes run-level snapshot and resource settings through sandbox client options', async () => {
     const client = new FakeSandboxClient();
     const sandboxModel = new RecordingFakeModel([
       {
@@ -1294,6 +1300,11 @@ describe('sandbox runner integration', () => {
           manifestEntries: 2,
           localDirFiles: 3,
         },
+        archiveLimits: {
+          maxInputBytes: 4,
+          maxExtractedBytes: 5,
+          maxMembers: 6,
+        },
       },
     });
 
@@ -1304,6 +1315,11 @@ describe('sandbox runner integration', () => {
     expect(client.createCalls[0]?.concurrencyLimits).toMatchObject({
       manifestEntries: 2,
       localDirFiles: 3,
+    });
+    expect(client.createCalls[0]?.archiveLimits).toMatchObject({
+      maxInputBytes: 4,
+      maxExtractedBytes: 5,
+      maxMembers: 6,
     });
   });
 
@@ -1461,12 +1477,25 @@ describe('sandbox runner integration', () => {
     const secondResult = await runner.run(sandboxAgent, resumedState, {
       sandbox: {
         client,
+        archiveLimits: {
+          maxInputBytes: 10,
+          maxExtractedBytes: 20,
+          maxMembers: 30,
+        },
       },
     });
 
     expect(secondResult.finalOutput).toBe('turn two');
     expect(client.createCalls).toHaveLength(1);
-    expect(client.resumeCalls).toHaveLength(1);
+    expect(client.resumeCalls).toMatchObject([
+      {
+        archiveLimits: {
+          maxInputBytes: 10,
+          maxExtractedBytes: 20,
+          maxMembers: 30,
+        },
+      },
+    ]);
   });
 
   it('sanitizes manifest data in serialized sandbox state envelopes', async () => {
@@ -2469,6 +2498,11 @@ describe('sandbox runner integration', () => {
 
   it('starts adopted preserved sandbox sessions before agent execution', async () => {
     const client = new StartableFakeSandboxClient();
+    const archiveLimits = {
+      maxInputBytes: 10,
+      maxExtractedBytes: 20,
+      maxMembers: 30,
+    };
     const sandboxAgent = new SandboxAgent({
       name: 'SandboxWorker',
       model: new RecordingFakeModel([]),
@@ -2505,6 +2539,7 @@ describe('sandbox runner integration', () => {
       startingAgent: sandboxAgent as Agent<unknown, any>,
       sandboxConfig: {
         client,
+        archiveLimits,
       },
       runState: state,
     });
@@ -2521,6 +2556,7 @@ describe('sandbox runner integration', () => {
     expect(client.resumeCalls.map((call) => call.state.sessionId)).toEqual([
       'resumed-session',
     ]);
+    expect(client.resumeCalls[0]?.archiveLimits).toEqual(archiveLimits);
     expect(client.startCalls).toEqual([
       {
         sessionId: 'resumed-session',

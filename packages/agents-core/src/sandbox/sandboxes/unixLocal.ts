@@ -24,9 +24,14 @@ import type {
   SandboxClient,
   SandboxClientOptions,
   SandboxClientCreateArgs,
+  SandboxArchiveLimits,
+  SandboxClientResumeOptions,
   SandboxConcurrencyLimits,
 } from '../client';
-import { normalizeSandboxClientCreateArgs } from '../client';
+import {
+  normalizeSandboxClientCreateArgs,
+  validateSandboxArchiveLimits,
+} from '../client';
 import {
   normalizeExposedPort,
   recordExposedPortEndpoint,
@@ -41,6 +46,7 @@ import {
   type SandboxSessionState,
   type ViewImageArgs,
   type WriteStdinArgs,
+  type WorkspaceArchiveOptions,
 } from '../session';
 import { Manifest, normalizeRelativePath } from '../manifest';
 import { SandboxConfigurationError } from '../errors';
@@ -107,6 +113,7 @@ export interface UnixLocalSandboxClientOptions extends SandboxClientOptions {
   defaultShell?: string;
   exposedPorts?: number[];
   concurrencyLimits?: SandboxConcurrencyLimits;
+  archiveLimits?: SandboxArchiveLimits | null;
 }
 
 export interface UnixLocalSandboxSessionState extends SandboxSessionState {
@@ -149,13 +156,24 @@ export class UnixLocalSandboxSession<
 > implements SandboxSession<TState> {
   readonly state: TState;
   protected readonly defaultShell?: string;
+  private archiveLimits?: SandboxArchiveLimits | null;
   private readonly activeProcesses = new Map<number, ActiveProcess>();
   private nextSessionId = 1;
   private closed = false;
 
-  constructor(args: { state: TState; defaultShell?: string }) {
+  constructor(args: {
+    state: TState;
+    defaultShell?: string;
+    archiveLimits?: SandboxArchiveLimits | null;
+  }) {
     this.state = args.state;
     this.defaultShell = args.defaultShell;
+    this.setArchiveLimits(args.archiveLimits);
+  }
+
+  setArchiveLimits(limits?: SandboxArchiveLimits | null): void {
+    validateSandboxArchiveLimits(limits);
+    this.archiveLimits = limits;
   }
 
   createEditor(runAs?: string): Editor {
@@ -434,8 +452,14 @@ export class UnixLocalSandboxSession<
 
   async hydrateWorkspace(
     data: string | ArrayBuffer | Uint8Array,
+    options: WorkspaceArchiveOptions = {},
   ): Promise<void> {
-    await restoreWorkspaceArchive(data, this.state.workspaceRootPath);
+    await restoreWorkspaceArchive(data, this.state.workspaceRootPath, {
+      archiveLimits:
+        options.archiveLimits === undefined
+          ? this.archiveLimits
+          : options.archiveLimits,
+    });
     await this.materializeRestoredWorkspaceMounts();
   }
 
@@ -875,6 +899,9 @@ export class UnixLocalSandboxClient implements SandboxClient<
       ...(createArgs.concurrencyLimits
         ? { concurrencyLimits: createArgs.concurrencyLimits }
         : {}),
+      ...(createArgs.archiveLimits !== undefined
+        ? { archiveLimits: createArgs.archiveLimits }
+        : {}),
     };
     assertLocalWorkspaceManifestMetadataSupported(
       'UnixLocalSandboxClient',
@@ -906,16 +933,23 @@ export class UnixLocalSandboxClient implements SandboxClient<
         configuredExposedPorts,
       },
       defaultShell: resolvedOptions.defaultShell,
+      archiveLimits: resolvedOptions.archiveLimits,
     });
   }
 
   async resume(
     state: UnixLocalSandboxSessionState,
+    options: SandboxClientResumeOptions = {},
   ): Promise<UnixLocalSandboxSession> {
-    const restoredState = await this.restoreIfNeeded(state);
+    const archiveLimits =
+      options.archiveLimits === undefined
+        ? this.options.archiveLimits
+        : options.archiveLimits;
+    const restoredState = await this.restoreIfNeeded(state, archiveLimits);
     return new UnixLocalSandboxSession({
       state: restoredState,
       defaultShell: this.options.defaultShell,
+      archiveLimits,
     });
   }
 
@@ -955,13 +989,18 @@ export class UnixLocalSandboxClient implements SandboxClient<
 
   private async restoreIfNeeded(
     state: UnixLocalSandboxSessionState,
+    archiveLimits?: SandboxArchiveLimits | null,
   ): Promise<UnixLocalSandboxSessionState> {
     if (await pathExists(state.workspaceRootPath)) {
       if (await canReuseLocalSnapshotWorkspace(state)) {
         return state;
       }
       if (await localSnapshotIsRestorable(state)) {
-        return await restoreSnapshotAndMounts(state, state.workspaceRootPath);
+        return await restoreSnapshotAndMounts(
+          state,
+          state.workspaceRootPath,
+          archiveLimits,
+        );
       }
       return state;
     }
@@ -983,6 +1022,7 @@ export class UnixLocalSandboxClient implements SandboxClient<
         workspaceRootOwned: true,
       },
       workspaceRootPath,
+      archiveLimits,
     );
   }
 }
@@ -990,10 +1030,12 @@ export class UnixLocalSandboxClient implements SandboxClient<
 async function restoreSnapshotAndMounts(
   state: UnixLocalSandboxSessionState,
   workspaceRootPath: string,
+  archiveLimits?: SandboxArchiveLimits | null,
 ): Promise<UnixLocalSandboxSessionState> {
   const restoredState = await restoreLocalSnapshotToWorkspace(
     state,
     workspaceRootPath,
+    { archiveLimits },
   );
   await materializeLocalWorkspaceManifestMounts(
     restoredState.manifest,
