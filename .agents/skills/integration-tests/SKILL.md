@@ -11,6 +11,12 @@ Run integration tests that require a local npm registry by starting `pnpm local-
 
 ## Workflow
 
+### Codex execution environment
+
+- When Codex invokes this skill, run both `pnpm local-npm:start` and the main pipeline outside the Codex sandbox by default (`sandbox_permissions=require_escalated`). The integration suites install dependencies inside fixture projects with `npm install`, `bun install`, Deno, Wrangler, local emulators, Docker, and other subprocesses; running them inside the Codex sandbox can cause environment-only failures such as `npm` `EPERM` writing to `~/.npm/_cacache/tmp` or Bun `PermissionDenied` writing to its tempdir.
+- Use sandboxed execution only when the user explicitly asks for it. If a sandboxed run fails during dependency installation or temp/cache writes, rerun the same exact pipeline outside the sandbox before classifying the failure as repo-induced.
+- Still keep the registry lifecycle local to the run: start Verdaccio before the pipeline and stop it after the pipeline, even when a failure occurs.
+
 ### 1. Start the local registry (subprocess)
 
 - Start a background process with `pnpm local-npm:start` and keep its session id so it can be stopped later.
