@@ -175,7 +175,10 @@ export class BatchTraceProcessor implements TracingProcessor {
     }
   }
 
-  async #exportBatches(force: boolean = false): Promise<void> {
+  async #exportBatches(
+    force: boolean = false,
+    signal?: AbortSignal,
+  ): Promise<void> {
     if (this.#buffer.length === 0) {
       return;
     }
@@ -187,7 +190,7 @@ export class BatchTraceProcessor implements TracingProcessor {
     const exportBatch = async (batch: Array<Trace | Span>): Promise<void> => {
       this.#exportInProgress = true;
       try {
-        await this.#exporter.export(batch);
+        await this.#exporter.export(batch, signal);
       } catch (error) {
         logger.error('Tracing exporter failed to export batch', error);
       } finally {
@@ -222,34 +225,49 @@ export class BatchTraceProcessor implements TracingProcessor {
   }
 
   async shutdown(timeout?: number): Promise<void> {
+    let shutdownTimeout: Timeout | undefined;
+    const shutdownAbortController = timeout
+      ? (this.#timeoutAbortController ?? new AbortController())
+      : undefined;
+
     if (timeout) {
-      this.#timer.setTimeout(() => {
-        // force shutdown the HTTP request
-        this.#timeoutAbortController?.abort();
+      this.#timeoutAbortController = shutdownAbortController ?? null;
+      shutdownTimeout = this.#timer.setTimeout(() => {
+        // Force shutdown the HTTP request.
+        shutdownAbortController?.abort();
       }, timeout);
+
+      if (typeof shutdownTimeout.unref === 'function') {
+        shutdownTimeout.unref();
+      }
     }
 
-    logger.debug('Shutting down gracefully');
-    while (this.#buffer.length > 0) {
-      logger.debug(
-        `Waiting for buffer to empty. Items left: ${this.#buffer.length}`,
-      );
-      if (!this.#exportInProgress) {
-        // no current export in progress. Forcing all items to be exported
-        await this.#exportBatches(true);
+    try {
+      logger.debug('Shutting down gracefully');
+      while (this.#buffer.length > 0) {
+        logger.debug(
+          `Waiting for buffer to empty. Items left: ${this.#buffer.length}`,
+        );
+        if (!this.#exportInProgress) {
+          // No current export in progress. Forcing all items to be exported.
+          await this.#exportBatches(true, shutdownAbortController?.signal);
+        }
+        if (shutdownAbortController?.signal.aborted) {
+          logger.debug('Timeout reached, force flushing');
+          break;
+        }
+        // Using setTimeout to add to the event loop and keep this alive until done.
+        await new Promise((resolve) => this.#timer.setTimeout(resolve, 500));
       }
-      if (this.#timeoutAbortController?.signal.aborted) {
-        logger.debug('Timeout reached, force flushing');
-        await this.#exportBatches(true);
-        break;
+      logger.debug('Buffer empty. Exiting');
+    } finally {
+      if (shutdownTimeout) {
+        this.#timer.clearTimeout(shutdownTimeout);
       }
-      // using setTimeout to add to the event loop and keep this alive until done
-      await new Promise((resolve) => this.#timer.setTimeout(resolve, 500));
-    }
-    logger.debug('Buffer empty. Exiting');
-    if (this.#timer && this.#timeout) {
-      // making sure there are no more requests
-      this.#timer.clearTimeout(this.#timeout);
+      if (this.#timer && this.#timeout) {
+        // Making sure there are no more requests.
+        this.#timer.clearTimeout(this.#timeout);
+      }
     }
   }
 
